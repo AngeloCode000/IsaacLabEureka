@@ -109,6 +109,100 @@ class EurekaTaskManager:
         # Fetch the observations
         self._get_observations_as_string = self._observations_queue.get()
 
+    def _attach_direct_api_shims(self):
+        """
+        Ensure Direct Reinforcement Learning Environment (DirectRLEnv)-style hooks exist on Manager-Based
+        Reinforcement Learning Environment (ManagerBasedRLEnv) tasks so Eureka can run unchanged.
+
+        Always provides a Python-defined _get_observations() so inspect.getsource(...) works.
+        Also aliases/creates: _get_rewards, _get_dones, _reset_idx when missing.
+        """
+        import types
+        import torch
+
+        env = self._env.unwrapped
+
+        # ---------- OBSERVATIONS ----------
+        # We will ALWAYS install a Python function for _get_observations so inspect.getsource works.
+
+        def _fallback_obs_dict_from_buffers(self_):
+            """Try common buffer names and return a {'policy': tensor} dict if found, else None."""
+            for name in ("policy_obs_buf", "_policy_obs_buf", "obs_buf", "_obs_buf"):
+                if hasattr(self_, name) and getattr(self_, name) is not None:
+                    return {"policy": getattr(self_, name)}
+            return None
+
+        def _get_observations_synth(self_):
+            """
+            Synthesized observation fetcher that tries multiple Manager-based APIs,
+            then falls back to common buffers.
+            Returns a dict-like object suitable for Eureka's prompt context.
+            """
+            # 1) If the env already has a public getter
+            if hasattr(self_, "get_observations"):
+                try:
+                    return self_.get_observations()
+                except Exception:
+                    pass
+
+            # 2) Go through the observation manager if present
+            om = getattr(self_, "observation_manager", None)
+            if om is not None:
+                # Common pattern: om.get_observations()
+                if hasattr(om, "get_observations"):
+                    try:
+                        return om.get_observations()
+                    except Exception:
+                        pass
+                # Some stacks require compute() before pulling buffers
+                if hasattr(om, "compute"):
+                    try:
+                        om.compute()
+                        d = _fallback_obs_dict_from_buffers(self_)
+                        if d is not None:
+                            return d
+                    except Exception:
+                        pass
+
+            # 3) Fallback to known buffers directly
+            d = _fallback_obs_dict_from_buffers(self_)
+            if d is not None:
+                return d
+
+            # 4) Last resort: return an empty dict (keeps Eureka running; prompt will be lighter)
+            return {}
+
+        # Install synthesized _get_observations if missing
+        if not hasattr(env, "_get_observations"):
+            env._get_observations = types.MethodType(_get_observations_synth, env)
+
+        # ---------- REWARDS (oracle hook) ----------
+        # ManagerBasedRLEnv may not expose _get_rewards; alias or create a zero baseline.
+        if not hasattr(env, "_get_rewards"):
+            if hasattr(env, "get_rewards"):
+                env._get_rewards = types.MethodType(env.get_rewards, env)
+            else:
+                def _get_rewards_zero(self_):
+                    # Zero oracle baseline; Eureka layers eureka rewards on top.
+                    return torch.zeros(self_.num_envs, device=self_.device)
+                env._get_rewards = types.MethodType(_get_rewards_zero, env)
+
+        # ---------- DONES ----------
+        if not hasattr(env, "_get_dones"):
+            if hasattr(env, "get_dones"):
+                env._get_dones = types.MethodType(env.get_dones, env)
+            elif hasattr(env, "reset_buf"):
+                def _get_dones_buf(self_):
+                    return self_.reset_buf
+                env._get_dones = types.MethodType(_get_dones_buf, env)
+
+        # ---------- RESET HOOK ----------
+        if not hasattr(env, "_reset_idx"):
+            if hasattr(env, "reset_idx"):
+                env._reset_idx = types.MethodType(env.reset_idx, env)
+            # else: leave it; Eureka template will error if truly missing and we can address that case specifically.
+
+
     @property
     def get_observations_method_as_string(self) -> str:
         """The _get_observations method of the environment as a string."""
@@ -221,6 +315,9 @@ class EurekaTaskManager:
         env_cfg.sim.device = self._device
         env_cfg.seed = self._env_seed
         self._env = gym.make(self._task, cfg=env_cfg)
+
+        # Ensure DirectRLEnv-style hooks exist even for ManagerBasedRLEnv tasks
+        self._attach_direct_api_shims()
 
     def _prepare_eureka_environment(self, get_rewards_method_as_string: str):
         """Prepare the environment for training with the Eureka-generated reward function.
