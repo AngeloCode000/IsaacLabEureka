@@ -1,0 +1,138 @@
+--------------ISAAC LAB EUREKA - RL + LLM TRAINING GUIDE--------------
+
+This guide explains how to set up, train, and play Reinforcement Learning (RL) tasks using Isaac Lab Eureka. It includes both Unitree Go1 and Cartpole task examples.
+
+--------------1. ENVIRONMENT SETUP--------------
+
+Export your API key:
+export OPENAI_API_KEY=sk-<API key>
+
+Navigate to your workspace:
+cd ~/workspaces/IsaacLabEureka
+
+--------------2. TRAIN--------------
+
+## (1) UNITREE GO1 ON FLAT TERRAIN
+
+```
+~/workspaces/IsaacLab/isaaclab.sh -p scripts/train.py \
+  --task Isaac-Velocity-Flat-Unitree-Go1-v0 \
+  --rl_library rsl_rl \
+  --gpt_model gpt-4o-mini \
+  --device cuda:0 \
+  --env_seed 123 \
+  --max_training_iterations 50000 \
+  --max_eureka_iterations 15 \
+  --feedback_subsampling 5 \
+  --temperature 0.6
+```
+
+Notes:
+
+* RSL-RL: Reinforcement Learning backend optimized for locomotion.
+* LLM: Large Language Model used by Eureka for reward design.
+* CUDA: Runs on GPU (Graphics Processing Unit).
+
+## (2) CARTPOLE TASK
+
+From the '~/workspaces/IsaacLabEureka' directory:
+
+```
+~/workspaces/IsaacLab/isaaclab.sh -p scripts/train.py \
+  --task Isaac-Cartpole-Direct-v0 \
+  --max_training_iterations 100 \
+  --rl_library rl_games \
+  --gpt_model gpt-5-mini
+```
+
+## (3) UNITREE GO1 ON ROUGH TERRAIN
+
+```
+~/workspaces/IsaacLab/isaaclab.sh -p scripts/train.py \
+  --task Isaac-Velocity-Rough-Unitree-Go1-v0 \
+  --max_training_iterations 100 \
+  --rl_library rl_games \
+  --gpt_model gpt-5-mini
+```
+
+Script usage:
+train.py [-h] [--task TASK] [--num_parallel_runs NUM_PARALLEL_RUNS] [--device DEVICE] [--env_seed ENV_SEED] [--max_eureka_iterations MAX_EUREKA_ITERATIONS] [--max_training_iterations MAX_TRAINING_ITERATIONS] [--feedback_subsampling FEEDBACK_SUBSAMPLING] [--temperature TEMPERATURE] [--gpt_model GPT_MODEL] [--rl_library {rsl_rl, rl_games}]
+
+--------------3. PLAY--------------
+
+## (1) CARTPOLE
+
+```
+~/workspaces/IsaacLab/isaaclab.sh -p scripts/play.py \
+  --task Isaac-Cartpole-Direct-v0 \
+  --checkpoint </path/to/checkpoint.pt> \
+  --num_envs 20 \
+  --rl_library rsl_rl
+```
+
+Example checkpoint:
+/home/eppl/workspaces/IsaacLabEureka/logs/rl_runs/rl_games_eureka/cartpole_direct/2025-09-17_18-08-33_Run-0/nn/last_cartpole_direct_ep_100_rew__193.14851_.pth
+
+## (2) UNITREE GO1
+
+TRAINING:
+
+```
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Rough-Unitree-Go1-v0 \
+  --num_envs 4096 \
+  --seed 42
+
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+  --task Isaac-Velocity-Rough-Unitree-Go1-v0 \
+  --num_envs 1000 \
+  --seed 42
+```
+
+PLAYING (with checkpoint):
+
+```
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
+  --task Isaac-Velocity-Rough-Unitree-Go1-v0 \
+  --checkpoint logs/rsl_rl/unitree_go1_rough/<run>/policy_05000.pt \
+  --num_envs 20
+```
+
+PLAYING (pretrained model):
+
+```
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
+  --task Isaac-Velocity-Rough-Unitree-Go1-v0 \
+  --use_pretrained_checkpoint \
+  --num_envs 20
+```
+
+--------------4. NOTES--------------
+
+* Use RSL-RL for locomotion tasks.
+* Use RL-Games for simpler control tasks.
+* Verify CUDA with 'nvidia-smi'.
+* Logs and checkpoints are saved in:
+  ~/workspaces/IsaacLabEureka/logs/
+* Always set --env_seed for reproducibility.
+* Increase both max_training_iterations and num_envs for stronger policies.
+
+--------------5. SUMMARY--------------
+
+| Task                                | RL Library | LLM Model   | Terrain | Recommended Iterations | Notes                    |
+| ----------------------------------- | ---------- | ----------- | ------- | ---------------------- | ------------------------ |
+| Isaac-Cartpole-Direct-v0            | rl_games   | gpt-5-mini  | N/A     | 100                    | Balancing task           |
+| Isaac-Velocity-Flat-Unitree-Go1-v0  | rsl_rl     | gpt-4o-mini | Flat    | 50,000                 | Velocity tracking        |
+| Isaac-Velocity-Rough-Unitree-Go1-v0 | rsl_rl     | gpt-5-mini  | Rough   | 50,000+                | Uneven terrain stability |
+
+--------------6. TIPS--------------
+
+* Increase feedback_subsampling for higher-quality reward shaping.
+* Lower temperature for consistent LLM feedback.
+* Monitor progress with TensorBoard or Isaac Sim logs.
+
+--------------AUTHOR & PROJECT--------------
+
+Author: EPPL Robotics Lab — Embry-Riddle Aeronautical University (ERAU)
+Project: IsaacLabEureka — AI-Guided Reinforcement Learning for Robotics
+
