@@ -23,34 +23,37 @@ TASKS_CFG = {
     },
     "Isaac-Velocity-Flat-Unitree-Go1-v0": {
         "description": (
-            "To make the go1 quadruped run forward with a velocity of exactly 2.0 m/s in the positive x "
-            "direction of the global coordinate frame. The policy will be trained in simulation and deployed "
-            "in the real world, so the policy should be as steady and stable as possible with minimal action "
-            "rate. Specifically, as it's running, the torso should remain near a z position of 0.34, and the "
-            "orientation should be perpendicular to gravity. Also, the legs should move smoothly and avoid the "
-            "DOF limits"
+            "Make the Unitree Go1 quadruped track a commanded forward velocity of 2.0 m/s on flat ground. "
+            "Prioritize steady locomotion with minimal action rate, keep the torso near 0.34 m, maintain an "
+            "upright orientation, and avoid hitting joint limits."
         ),
-        "success_metric": (
-            "self.episode_length_buf[env_ids].float().mean() / self.max_episode_length"
-        ),
+        "success_metric": "self.episode_length_buf[env_ids].float().mean() / self.max_episode_length",
         "success_metric_to_win": 1.0,
         "success_metric_tolerance": 0.02,
     },
     "Isaac-Velocity-Rough-Unitree-Go1-v0": {
         "description": (
-           "Make the Unitree Go1 track a forward velocity of 2.0 m/s over rough terrain. "
-           "Prioritize stable, low-jerk locomotion suitable for transfer. Keep torso height "
-         "near ~0.34 m and orientation aligned with gravity; avoid joint limit banging."
-     ),
-    # Use a robust, generic success metric (episode length fraction) to avoid missing attributes.
-    "success_metric": "self.episode_length_buf[env_ids].float().mean() / self.max_episode_length",
-    "success_metric_to_win": 1.0,
-    "success_metric_tolerance": 0.02,
-},
-
+            "Make the Unitree Go1 traverse rough terrain while tracking a forward velocity command of 2.0 m/s. "
+            "Aim for smooth, transferable gaits that keep the torso near 0.34 m, aligned with gravity, and avoid "
+            "banging into joint limits."
+        ),
+        "success_metric": "self.episode_length_buf[env_ids].float().mean() / self.max_episode_length",
+        "success_metric_to_win": 1.0,
+        "success_metric_tolerance": 0.02,
+    },
+    "Isaac-Velocity-Rough-OpenMutt-v0": {
+        "description": (
+            "Teach the OpenMutt quadruped to follow velocity commands across rough terrain. Reward policies that "
+            "maintain balance, suppress rapid joint motions, and keep the chassis upright while avoiding joint-limit "
+            "impacts."
+        ),
+        "success_metric": "self.episode_length_buf[env_ids].float().mean() / self.max_episode_length",
+        "success_metric_to_win": 1.0,
+        "success_metric_tolerance": 0.02,
+    },
     "Isaac-Quadcopter-Direct-v0": {
         "description": (
-            "bring the quadcopter to the target position: self._desired_pos_w, while making sure it flies smoothly"
+            "Bring the quadcopter to the target position self._desired_pos_w while keeping the flight smooth."
         ),
         "success_metric": (
             "torch.linalg.norm(self._desired_pos_w[env_ids] - self._robot.data.root_pos_w[env_ids], dim=1).mean()"
@@ -59,4 +62,3 @@ TASKS_CFG = {
         "success_metric_tolerance": 0.2,
     },
 }
-

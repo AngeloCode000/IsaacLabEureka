@@ -7,7 +7,7 @@
 import argparse
 import math
 
-from isaaclab_eureka.utils import get_freest_gpu
+from isaaclab_eureka.utils import get_freest_gpu, shrink_physx_gpu_buffers
 
 
 def main(args_cli):
@@ -38,6 +38,7 @@ def main(args_cli):
     env_cfg: DirectRLEnvCfg = parse_env_cfg(task)
     env_cfg.sim.device = device
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    shrink_physx_gpu_buffers(env_cfg)
     env = gym.make(task, cfg=env_cfg)
 
     """Run the inferencing of the task."""
@@ -58,7 +59,7 @@ def main(args_cli):
         policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
         # reset environment
-        obs, _ = env.get_observations()
+        obs = env.get_observations()
         # simulate environment
         while simulation_app.is_running():
             # run everything in inference mode
