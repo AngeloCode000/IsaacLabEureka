@@ -55,6 +55,28 @@ From the '~/workspaces/IsaacLabEureka' directory:
   --gpt_model gpt-5-mini
 ```
 
+## (3) OpenMutt ON ROUGH TERRAIN
+
+```
+cd /workspaces/IsaacLabEureka
+
+export PYTHONPATH=/workspaces/IsaacLab/source:~/workspaces/IsaacLab/source/isaaclab_tasks:$PYTHONPATH
+
+OPENAI_API_KEY=YOUR API KEY \
+~/workspaces/IsaacLab/isaaclab.sh -p ~/workspaces/IsaacLabEureka/scripts/train.py \
+  --task Isaac-Velocity-Rough-OpenMutt-v0 \
+  --rl_library rsl_rl \
+  --gpt_model gpt-4o-mini \
+  --device cuda:0 \
+  --env_seed 123 \
+  --max_training_iterations 50000 \
+  --max_eureka_iterations 15 \
+  --feedback_subsampling 5 \
+  --temperature 0.6
+
+```
+
+
 Script usage:
 train.py [-h] [--task TASK] [--num_parallel_runs NUM_PARALLEL_RUNS] [--device DEVICE] [--env_seed ENV_SEED] [--max_eureka_iterations MAX_EUREKA_ITERATIONS] [--max_training_iterations MAX_TRAINING_ITERATIONS] [--feedback_subsampling FEEDBACK_SUBSAMPLING] [--temperature TEMPERATURE] [--gpt_model GPT_MODEL] [--rl_library {rsl_rl, rl_games}]
 
