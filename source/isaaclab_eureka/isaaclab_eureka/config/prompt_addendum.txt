@@ -1,0 +1,4 @@
+Key guidance for reward revisions:
+- Do not wrap velocity terms (or the total reward) in torch.exp; small temperatures zero out the signal.
+- Reward policies with a positive bonus when commanded speed is tracked; velocity must dominate other terms.
+- Keep penalties (balance, joints, limits) scaled gently so they cannot overwhelm the velocity reward.

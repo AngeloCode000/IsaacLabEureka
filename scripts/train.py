@@ -11,6 +11,16 @@ from isaaclab_eureka.eureka import Eureka
 
 
 def main(args_cli):
+    prompt_addendum = None
+    if args_cli.prompt_addendum_file is not None:
+        with open(args_cli.prompt_addendum_file, "r", encoding="utf-8") as f:
+            prompt_addendum = f.read()
+
+    manual_reward = None
+    if args_cli.manual_reward_file is not None:
+        with open(args_cli.manual_reward_file, "r", encoding="utf-8") as f:
+            manual_reward = f.read()
+
     eureka = Eureka(
         task=args_cli.task,
         rl_library=args_cli.rl_library,
@@ -21,6 +31,8 @@ def main(args_cli):
         feedback_subsampling=args_cli.feedback_subsampling,
         temperature=args_cli.temperature,
         gpt_model=args_cli.gpt_model,
+        prompt_addendum=prompt_addendum,
+        manual_reward=manual_reward,
     )
 
     eureka.run(max_eureka_iterations=args_cli.max_eureka_iterations)
@@ -60,6 +72,21 @@ if __name__ == "__main__":
         default="rsl_rl",
         choices=["rsl_rl", "rl_games"],
         help="The RL training library to use.",
+    )
+    parser.add_argument(
+        "--prompt_addendum_file",
+        type=str,
+        default=None,
+        help="Optional path to a text file whose contents are appended to every Eureka user prompt.",
+    )
+    parser.add_argument(
+        "--manual_reward_file",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a file containing a `_get_rewards_eureka` function. When provided, the first Eureka "
+            "iteration runs strictly with that reward before falling back to GPT suggestions."
+        ),
     )
     args_cli = parser.parse_args()
 
