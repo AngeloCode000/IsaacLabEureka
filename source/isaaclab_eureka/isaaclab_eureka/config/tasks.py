@@ -41,11 +41,21 @@ TASKS_CFG = {
         "success_metric_to_win": 1.0,
         "success_metric_tolerance": 0.02,
     },
+    "Isaac-Velocity-Flat-OpenMutt-v0": {
+        "description": (
+            "Make the OpenMutt quadruped track a commanded forward velocity between 0.6 and 1.0 m/s on flat terrain. "
+            "Aim for smooth, transferable gaits that keep the torso aligned with gravity and limit excessive joint "
+            "motion."
+        ),
+        "success_metric": "self.episode_length_buf[env_ids].float().mean() / self.max_episode_length",
+        "success_metric_to_win": 1.0,
+        "success_metric_tolerance": 0.02,
+    },
     "Isaac-Velocity-Rough-OpenMutt-v0": {
         "description": (
-            "Teach the OpenMutt quadruped to follow velocity commands across rough terrain. Reward policies that "
-            "maintain balance, suppress rapid joint motions, and keep the chassis upright while avoiding joint-limit "
-            "impacts."
+            "Make the OpenMutt quadruped track a commanded forward velocity between 0.6 and 1.0 m/s across rough "
+            "terrain. Aim for smooth, transferable gaits that keep the torso aligned with gravity and limit excessive "
+            "joint motion."
         ),
         "success_metric": "self.episode_length_buf[env_ids].float().mean() / self.max_episode_length",
         "success_metric_to_win": 1.0,
