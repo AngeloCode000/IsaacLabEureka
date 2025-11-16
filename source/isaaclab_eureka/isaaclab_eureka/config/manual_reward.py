@@ -1,5 +1,13 @@
 def _get_rewards_eureka(self):
-    """Manual reward shaping that prioritises forward velocity tracking in the robot body frame."""
+    """Simplified reward: strongly incentivize commanded forward velocity.
+
+    Rationale:
+    - Policy tends to stay in place; we boost forward-velocity tracking and add a
+      direct linear velocity bonus in commanded direction.
+    - Simplify shaping: keep small upright term; soften lateral/backward and
+      joint smoothness penalties; drop stance/contact shaping to avoid distracting
+      gradients.
+    """
     import torch
 
     from isaaclab.utils.math import quat_apply, quat_apply_inverse, yaw_quat
@@ -43,26 +51,40 @@ def _get_rewards_eureka(self):
     desired_forward = command_body[..., 0]
     command_speed_scalar = torch.abs(desired_forward)
 
-    # Track the commanded forward velocity with a sharper peak and encourage any forward drive when commanded.
-    speed_tolerance = torch.clamp(0.35 + 0.35 * command_speed_scalar, min=0.35)
+    # Track the commanded forward velocity with a sharper peak and add a
+    # direct linear bonus along commanded direction.
+    speed_tolerance = torch.clamp(0.3 + 0.3 * command_speed_scalar, min=0.3)
     speed_error = current_forward - desired_forward
     forward_tracking_reward = torch.exp(-0.5 * torch.square(speed_error / speed_tolerance))
-    forward_gain = torch.where(command_speed_scalar > 0.2, torch.full_like(command_speed_scalar, 6.0), torch.full_like(command_speed_scalar, 3.0))
-    forward_motion_bonus = torch.where(
+    # Strong weight on tracking; strictly zero if command is near-zero to avoid drift bias
+    forward_gain = torch.where(
         command_speed_scalar > 0.2,
-        1.0 * torch.relu(current_forward),
-        0.5 * torch.relu(current_forward),
+        torch.full_like(command_speed_scalar, 8.0),
+        torch.zeros_like(command_speed_scalar),
     )
-    forward_reward = forward_gain * forward_tracking_reward + forward_motion_bonus
+    # Linear bonus in the commanded direction (sign-aware)
+    commanded_dir = torch.sign(desired_forward)
+    aligned_speed = commanded_dir * current_forward
+    speed_bonus = torch.where(
+        command_speed_scalar > 0.2,
+        1.5 * torch.relu(aligned_speed),
+        torch.zeros_like(aligned_speed),
+    )
+    forward_reward = forward_gain * forward_tracking_reward + speed_bonus
 
     # Penalise sideways and backward motion in the body frame.
     lateral_weight = torch.where(
         command_speed_scalar > 0.2,
-        torch.full_like(command_speed_scalar, 1.5),
-        torch.full_like(command_speed_scalar, 0.75),
+        torch.full_like(command_speed_scalar, 0.8),
+        torch.full_like(command_speed_scalar, 0.4),
     )
     lateral_penalty = lateral_weight * torch.abs(current_lateral)
-    backward_penalty = 1.5 * torch.relu(-current_forward)
+    # Small penalty for motion opposite to command (zero when no command)
+    backward_penalty = torch.where(
+        command_speed_scalar > 0.2,
+        0.6 * torch.relu(-aligned_speed),
+        torch.zeros_like(aligned_speed),
+    )
 
     # Encourage aligning the robot's forward axis with the commanded heading when the command is meaningful.
     forward_axis_body = torch.zeros_like(root_lin_vel_w)
@@ -79,79 +101,45 @@ def _get_rewards_eureka(self):
     heading_threshold = 0.15
     heading_reward = torch.where(
         command_speed_heading.squeeze(-1) > heading_threshold,
-        torch.clamp(heading_alignment, min=0.0),
+        0.5 * torch.clamp(heading_alignment, min=0.0),
         torch.zeros_like(heading_alignment),
     )
 
     upright_error = torch.linalg.norm(chassis_orientation[..., :2], dim=-1)
     upright_tolerance = 0.3
-    balance_reward = torch.clamp(1.0 - upright_error / upright_tolerance, min=0.0)
+    balance_reward = 0.5 * torch.clamp(1.0 - upright_error / upright_tolerance, min=0.0)
 
+    # Softer joint smoothness penalties so they don't dominate
     smooth_scale = torch.where(
         command_speed_scalar < 0.3,
-        torch.full_like(command_speed_scalar, 1.2),
+        torch.full_like(command_speed_scalar, 1.0),
         torch.ones_like(command_speed_scalar),
     )
-    joint_motion_penalty = 0.01 * smooth_scale * torch.mean(torch.abs(joint_velocities), dim=-1)
+    joint_motion_penalty = 0.005 * smooth_scale * torch.mean(torch.abs(joint_velocities), dim=-1)
 
     if not hasattr(self, "_prev_joint_velocities"):
         self._prev_joint_velocities = torch.zeros_like(joint_velocities)
     joint_acc = torch.abs(joint_velocities - self._prev_joint_velocities) / max(step_dt, 1e-3)
-    joint_acc_penalty = 0.005 * smooth_scale * torch.mean(joint_acc, dim=-1)
+    joint_acc_penalty = 0.001 * smooth_scale * torch.mean(joint_acc, dim=-1)
     self._prev_joint_velocities = joint_velocities.detach().clone()
 
     excess_upper = torch.relu(joint_positions - joint_limit_upper)
     excess_lower = torch.relu(joint_limit_lower - joint_positions)
     joint_limit_penalty = 0.2 * (excess_upper + excess_lower).sum(dim=-1)
 
-    # Contact-based shaping: penalize non-foot contacts and reward balanced stance counts.
+    # Drop contact/stance shaping to simplify signal
     contact_penalty = torch.zeros(self.num_envs, device=device)
     stance_balance_reward = torch.zeros(self.num_envs, device=device)
-    sensors = getattr(self.scene, "sensors", None)
-    contact_sensor = None
-    if sensors is not None:
-        if isinstance(sensors, dict):
-            contact_sensor = sensors.get("contact_forces")
-        else:
-            getter = getattr(sensors, "get", None)
-            if callable(getter):
-                contact_sensor = getter("contact_forces")
-    if contact_sensor is not None:
-        net_forces = getattr(contact_sensor.data, "net_forces_w", None)
-        body_names = getattr(contact_sensor, "body_names", [])
-        if net_forces is not None and len(body_names) == net_forces.shape[1]:
-            if not hasattr(self, "_foot_contact_mask_cpu"):
-                foot_keywords = ("Leg_Knee_Cartilage_Outer",)
-                foot_mask_list = [
-                    any(keyword in body_name for keyword in foot_keywords) for body_name in body_names
-                ]
-                self._foot_contact_mask_cpu = torch.tensor(foot_mask_list, dtype=torch.bool)
-            foot_mask = self._foot_contact_mask_cpu.to(net_forces.device)
-            if torch.any(foot_mask):
-                non_foot_mask = ~foot_mask
-                contact_magnitudes = torch.linalg.norm(net_forces, dim=-1)
-                contact_active = contact_magnitudes > 1.0
-                non_foot_contact_count = (contact_active & non_foot_mask.unsqueeze(0)).sum(dim=1).float()
-                contact_penalty = 0.1 * non_foot_contact_count.to(device)
-
-                foot_contacts = (contact_active & foot_mask.unsqueeze(0)).float()
-                foot_contact_count = foot_contacts.sum(dim=1)
-                stance_target = 2.0
-                stance_balance_reward = 0.1 * torch.exp(
-                    -0.5 * torch.square((foot_contact_count - stance_target) / max(stance_target, 1.0))
-                ).to(device)
 
     total_reward = (
         forward_reward
         + heading_reward
         + balance_reward
-        + stance_balance_reward
         - joint_motion_penalty
         - joint_acc_penalty
         - joint_limit_penalty
         - lateral_penalty
         - backward_penalty
-        - contact_penalty
     )
     rewards_dict = {
         "forward_reward": forward_reward,
