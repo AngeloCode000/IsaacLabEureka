@@ -20,6 +20,10 @@ from isaaclab_eureka.managers import EurekaTaskManager, LLMManager
 from isaaclab_eureka.utils import load_tensorboard_logs
 
 
+MAX_FEEDBACK_VALUES = 64
+MAX_FEEDBACK_CHARS = 30_000
+
+
 class Eureka:
     """Orchestrates the training of the RL agent using the LLM."""
 
@@ -246,7 +250,8 @@ class Eureka:
                 if metric_name == "success_metric":
                     metric_name = "task_score"
                     success_metric_max = metric_best
-                data_string = [f"{data:.2f}" for data in metric_data[::feedback_subsampling]]
+                sampled_values = metric_data[::feedback_subsampling][:MAX_FEEDBACK_VALUES]
+                data_string = [f"{data:.2f}" for data in sampled_values]
                 feedback_string = (
                     f"{metric_name}: {data_string}, Min: {metric_min:.2f}, Max: {metric_max:.2f}, Mean:"
                     f" {metric_mean:.2f} \n"
@@ -257,6 +262,13 @@ class Eureka:
                 total_feed_back_string += feedback_string
 
         total_feed_back_string += f"\nThe desired task_score to win is: {self._success_metric_to_win:.2f}\n"
+        if len(total_feed_back_string) > MAX_FEEDBACK_CHARS:
+            head = MAX_FEEDBACK_CHARS // 2
+            tail = MAX_FEEDBACK_CHARS - head
+            notice = "\n\n[truncated feedback to stay within prompt budget]\n\n"
+            total_feed_back_string = (
+                f"{total_feed_back_string[:head]}{notice}{total_feed_back_string[-tail:]}"
+            )
         return total_feed_back_string, success_metric_max, rewards_correlation
 
     def _log_iteration_results(self, iter: int, results: list):

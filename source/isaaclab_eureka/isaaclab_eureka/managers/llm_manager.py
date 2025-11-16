@@ -7,6 +7,23 @@ import re
 
 import openai
 
+MAX_ASSISTANT_CHARS = 40_000
+MAX_USER_CHARS = 60_000
+
+
+def _truncate_message(content: str, limit: int, role: str) -> str:
+    """Clamp message size while keeping the most relevant context."""
+
+    if content is None or len(content) <= limit:
+        return content
+
+    head = limit // 2
+    tail = limit - head
+    notice = (
+        f"\n\n[truncated {role} message to {limit} chars to stay under the model context limit]\n\n"
+    )
+    return f"{content[:head]}{notice}{content[-tail:]}"
+
 
 class LLMManager:
     """Manager to interface with the LLM API.
@@ -73,8 +90,11 @@ class LLMManager:
             Exception: If there is an error with the LLM API
         """
         if assistant_prompt is not None:
-            self._prompts.append({"role": "assistant", "content": assistant_prompt})
-        self._prompts.append({"role": "user", "content": user_prompt})
+            truncated_assistant = _truncate_message(assistant_prompt, MAX_ASSISTANT_CHARS, "assistant")
+            self._prompts.append({"role": "assistant", "content": truncated_assistant})
+
+        truncated_user = _truncate_message(user_prompt, MAX_USER_CHARS, "user")
+        self._prompts.append({"role": "user", "content": truncated_user})
 
         # The official Eureka code only keeps the last round of feedback
         if len(self._prompts) == 6:
