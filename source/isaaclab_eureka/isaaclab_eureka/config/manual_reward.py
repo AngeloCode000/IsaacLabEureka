@@ -109,6 +109,15 @@ def _get_rewards_eureka(self):
     upright_tolerance = 0.3
     balance_reward = 0.5 * torch.clamp(1.0 - upright_error / upright_tolerance, min=0.0)
 
+    # Gentle encouragement: keep base Z-axis parallel with gravity (body parallel to ground).
+    # Compute base Z-axis in world frame and reward its alignment with world Z (sign-agnostic).
+    # This is intentionally small so it cannot outweigh velocity/stability terms.
+    z_axis_body = torch.zeros_like(root_lin_vel_w)
+    z_axis_body[..., 2] = 1.0
+    base_z_world = quat_apply(root_quat_w, z_axis_body)[..., :3]
+    z_alignment = torch.abs(base_z_world[..., 2])  # 1.0 when parallel to +/- world Z
+    z_parallel_reward = 0.15 * z_alignment
+
     # Softer joint smoothness penalties so they don't dominate
     smooth_scale = torch.where(
         command_speed_scalar < 0.3,
@@ -135,6 +144,7 @@ def _get_rewards_eureka(self):
         forward_reward
         + heading_reward
         + balance_reward
+        + z_parallel_reward
         - joint_motion_penalty
         - joint_acc_penalty
         - joint_limit_penalty
@@ -145,6 +155,7 @@ def _get_rewards_eureka(self):
         "forward_reward": forward_reward,
         "heading_reward": heading_reward,
         "balance_reward": balance_reward,
+        "z_parallel_reward": z_parallel_reward,
         "stance_balance_reward": stance_balance_reward,
         "lateral_penalty": lateral_penalty,
         "backward_penalty": backward_penalty,

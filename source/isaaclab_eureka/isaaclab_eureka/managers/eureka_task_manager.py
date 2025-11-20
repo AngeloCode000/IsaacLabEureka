@@ -21,13 +21,22 @@ import torch
 def _get_rewards(self):
     rewards_oracle = self._get_rewards_oracle()
     rewards_eureka, rewards_dict = self._get_rewards_eureka()
+
+    # Sanitize and gently clip to keep training stable.
+    rewards_oracle = torch.nan_to_num(rewards_oracle, nan=0.0, posinf=0.0, neginf=0.0)
+    rewards_eureka = torch.nan_to_num(rewards_eureka, nan=0.0, posinf=0.0, neginf=0.0)
+    rewards_eureka = torch.clamp(rewards_eureka, min=-100.0, max=100.0)
+
     self._eureka_episode_sums["eureka_total_rewards"] += rewards_eureka
     self._eureka_episode_sums["oracle_total_rewards"] += rewards_oracle
     for key in rewards_dict.keys():
         if key not in self._eureka_episode_sums:
             self._eureka_episode_sums[key] = torch.zeros(self.num_envs, device=self.device)
-        self._eureka_episode_sums[key] += rewards_dict[key]
-    return rewards_oracle + rewards_eureka
+        # Also sanitize logged components to avoid NaNs in summaries.
+        self._eureka_episode_sums[key] += torch.nan_to_num(rewards_dict[key], nan=0.0, posinf=0.0, neginf=0.0)
+    combined = rewards_oracle + rewards_eureka
+    combined = torch.clamp(combined, min=-1000.0, max=1000.0)
+    return combined
 """
 
 
@@ -513,6 +522,27 @@ class EurekaTaskManager:
             exec(template_reset_string_with_success_metric, namespace)
             setattr(env, "_reset_idx", types.MethodType(namespace["_reset_idx"], env))
 
+        # Add commonly used math helpers to the execution namespace so GPT rewards
+        # can call them without explicitly importing.
+        try:
+            from isaaclab.utils.math import (
+                quat_apply,
+                quat_apply_inverse,
+                yaw_quat,
+                wrap_to_pi,
+            )
+            namespace.update(
+                {
+                    "quat_apply": quat_apply,
+                    "quat_apply_inverse": quat_apply_inverse,
+                    "yaw_quat": yaw_quat,
+                    "wrap_to_pi": wrap_to_pi,
+                }
+            )
+        except Exception:
+            # If imports fail, continue; user code may not need them.
+            pass
+
         # Add the GPT generated reward function to the environment
         get_rewards_method_as_string = f"from {env.__module__} import * \nimport torch\n" + get_rewards_method_as_string
         exec(get_rewards_method_as_string, namespace)
@@ -534,18 +564,25 @@ class EurekaTaskManager:
             def _compute_with_eureka(self, dt):
                 oracle = self._compute_original(dt)
                 rewards_eureka, rewards_dict = env._get_rewards_eureka()
+
+                # Sanitize and clip to prevent reward explosions causing NaNs.
+                oracle = torch.nan_to_num(oracle, nan=0.0, posinf=0.0, neginf=0.0)
+                rewards_eureka = torch.nan_to_num(rewards_eureka, nan=0.0, posinf=0.0, neginf=0.0)
+                rewards_eureka = torch.clamp(rewards_eureka, min=-100.0, max=100.0)
+
                 env._eureka_episode_sums["eureka_total_rewards"] += rewards_eureka
                 env._eureka_episode_sums["oracle_total_rewards"] += oracle
                 for key, value in rewards_dict.items():
                     if key not in env._eureka_episode_sums:
                         env._eureka_episode_sums[key] = torch.zeros_like(value)
-                    env._eureka_episode_sums[key] += value
+                    env._eureka_episode_sums[key] += torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
                 # Update the internal reward buffer so all downstream consumers see the combined reward.
                 if hasattr(self, "_reward_buf"):
                     self._reward_buf += rewards_eureka
                     combined = self._reward_buf
                 else:
                     combined = oracle + rewards_eureka
+                combined = torch.clamp(combined, min=-1000.0, max=1000.0)
                 return combined
 
             reward_manager.compute = types.MethodType(_compute_with_eureka, reward_manager)
