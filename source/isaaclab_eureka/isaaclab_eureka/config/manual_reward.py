@@ -57,16 +57,16 @@ def _get_rewards_eureka(self):
 
     forward_gain = torch.where(
         command_speed_scalar > 0.2,
-        torch.full_like(command_speed_scalar, 8.0),
-        torch.zeros_like(command_speed_scalar),
+        torch.full_like(command_speed_scalar, 6.0),
+        torch.full_like(command_speed_scalar, 1.5),
     )
 
     commanded_dir = torch.sign(desired_forward)
     aligned_speed = commanded_dir * current_forward
     speed_bonus = torch.where(
         command_speed_scalar > 0.2,
-        1.5 * torch.relu(aligned_speed),
-        torch.zeros_like(aligned_speed),
+        1.0 * torch.relu(aligned_speed),
+        0.25 * torch.relu(aligned_speed),
     )
     forward_reward = forward_gain * forward_tracking_reward + speed_bonus
 
@@ -109,15 +109,15 @@ def _get_rewards_eureka(self):
     # ---------------------------------------------------------------------
     lateral_weight = torch.where(
         command_speed_scalar > 0.2,
-        torch.full_like(command_speed_scalar, 0.8),
-        torch.full_like(command_speed_scalar, 0.4),
+        torch.full_like(command_speed_scalar, 1.0),
+        torch.full_like(command_speed_scalar, 0.6),
     )
     lateral_penalty = lateral_weight * torch.abs(current_lateral)
 
     backward_penalty = torch.where(
         command_speed_scalar > 0.2,
-        0.6 * torch.relu(-aligned_speed),
-        torch.zeros_like(aligned_speed),
+        0.8 * torch.relu(-aligned_speed),
+        0.2 * torch.relu(-aligned_speed),
     )
 
     # ---------------------------------------------------------------------
@@ -146,15 +146,14 @@ def _get_rewards_eureka(self):
     # 5) Upright stability & roll/pitch-style shaping
     # ---------------------------------------------------------------------
     upright_error = torch.linalg.norm(chassis_orientation[..., :2], dim=-1)
-    upright_tolerance = 0.3
-    balance_reward = 0.5 * torch.clamp(1.0 - upright_error / upright_tolerance, min=0.0)
+    balance_reward = 0.8 * torch.exp(-0.5 * torch.square(upright_error / 0.25))
 
     # Gentle encouragement: base Z-axis parallel to world Z.
     z_axis_body = torch.zeros_like(root_lin_vel_w)
     z_axis_body[..., 2] = 1.0
     base_z_world = quat_apply(root_quat_w, z_axis_body)[..., :3]
     z_alignment = torch.abs(base_z_world[..., 2])  # 1.0 when parallel to +/- world Z
-    z_parallel_reward = 0.15 * z_alignment
+    z_parallel_reward = 0.25 * z_alignment
 
     # ---------------------------------------------------------------------
     # 6) Height tracking (blog: (z - z_ref)^2 penalty)
@@ -172,13 +171,16 @@ def _get_rewards_eureka(self):
         desired_height = desired_height.to(device).squeeze(-1)
 
     height_error = base_height - desired_height
-    height_penalty = 1.0 * torch.square(height_error)  # tune weight
+    height_penalty = 2.0 * torch.square(height_error)  # tune weight
 
     # ---------------------------------------------------------------------
     # 7) Vertical velocity penalty (blog: v_z^2)
     # ---------------------------------------------------------------------
     vertical_vel = root_lin_vel_w[..., 2]
-    vertical_vel_penalty = 0.1 * torch.square(vertical_vel)  # tune weight
+    vertical_vel_penalty = 0.25 * torch.square(vertical_vel)  # tune weight
+
+    # Penalise rapid roll/pitch angular rates that make the robot shake.
+    roll_pitch_rate_penalty = 0.2 * torch.linalg.norm(root_ang_vel_w[..., :2], dim=-1)
 
     # ---------------------------------------------------------------------
     # 8) Pose similarity penalty (blog: ||q - q_default||^2)
@@ -199,20 +201,21 @@ def _get_rewards_eureka(self):
     # ---------------------------------------------------------------------
     smooth_scale = torch.where(
         command_speed_scalar < 0.3,
-        torch.full_like(command_speed_scalar, 1.0),
+        torch.full_like(command_speed_scalar, 1.2),
         torch.ones_like(command_speed_scalar),
     )
-    joint_motion_penalty = 0.005 * smooth_scale * torch.mean(torch.abs(joint_velocities), dim=-1)
+    joint_motion_penalty = 0.01 * smooth_scale * torch.mean(torch.abs(joint_velocities), dim=-1)
 
     if not hasattr(self, "_prev_joint_velocities"):
         self._prev_joint_velocities = torch.zeros_like(joint_velocities)
     joint_acc = torch.abs(joint_velocities - self._prev_joint_velocities) / max(step_dt, 1e-3)
-    joint_acc_penalty = 0.001 * smooth_scale * torch.mean(joint_acc, dim=-1)
+    joint_acc_clipped = torch.clamp(joint_acc, max=200.0)
+    joint_acc_penalty = 0.003 * smooth_scale * torch.mean(joint_acc_clipped, dim=-1)
     self._prev_joint_velocities = joint_velocities.detach().clone()
 
     excess_upper = torch.relu(joint_positions - joint_limit_upper)
     excess_lower = torch.relu(joint_limit_lower - joint_positions)
-    joint_limit_penalty = 0.2 * (excess_upper + excess_lower).sum(dim=-1)
+    joint_limit_penalty = 0.3 * (excess_upper + excess_lower).sum(dim=-1)
 
     # ---------------------------------------------------------------------
     # 10) Explicit action-rate penalty (blog: ||a_t - a_{t-1}||^2)
@@ -224,7 +227,8 @@ def _get_rewards_eureka(self):
         if not hasattr(self, "_prev_actions"):
             self._prev_actions = torch.zeros_like(actions)
         action_delta = actions - self._prev_actions
-        action_rate_penalty = 0.001 * torch.mean(torch.square(action_delta), dim=-1)
+        action_delta_clipped = torch.clamp(action_delta, min=-2.0, max=2.0)
+        action_rate_penalty = 0.01 * torch.mean(torch.square(action_delta_clipped), dim=-1)
         self._prev_actions = actions.detach().clone()
 
     # ---------------------------------------------------------------------
@@ -238,7 +242,10 @@ def _get_rewards_eureka(self):
         self._debug_contact_once = True
 
     contact_penalty = torch.zeros(self.num_envs, device=device)
+    stance_balance_reward = torch.zeros(self.num_envs, device=device)
     contact_forces = None
+    force_mag = None
+    valid_feet = []
     contact_sensor = getattr(self.scene, "contact_forces", None)
     if contact_sensor is None and hasattr(self.scene, "sensors"):
         contact_sensor = self.scene.sensors.get("contact_forces", None)
@@ -300,7 +307,6 @@ def _get_rewards_eureka(self):
                         pass
                     break
         if num_bodies > 0:
-            valid_feet = []
             if foot_indices is not None:
                 valid_feet = [i for i in foot_indices if 0 <= i < num_bodies]
             if valid_feet:
@@ -309,9 +315,16 @@ def _get_rewards_eureka(self):
                 non_foot_forces = force_mag[:, body_mask]
             else:
                 non_foot_forces = force_mag
-            contact_penalty = 0.02 * non_foot_forces.sum(dim=-1)
+            contact_penalty = 0.03 * non_foot_forces.sum(dim=-1)
 
-    stance_balance_reward = torch.zeros(self.num_envs, device=device)
+            if valid_feet:
+                foot_ids_tensor = torch.as_tensor(valid_feet, device=device, dtype=torch.long)
+                foot_forces = force_mag[:, foot_ids_tensor]
+                stance_contacts = (foot_forces > 5.0).float()
+                stance_count = stance_contacts.sum(dim=-1)
+                stance_balance_reward = 0.1 * torch.exp(
+                    -0.5 * torch.square((stance_count - 2.5) / 1.0)
+                )
 
     # ---------------------------------------------------------------------
     # Total reward aggregation
@@ -324,6 +337,7 @@ def _get_rewards_eureka(self):
         + z_parallel_reward
         + stance_balance_reward
         - contact_penalty
+        - roll_pitch_rate_penalty
         - joint_motion_penalty
         - joint_acc_penalty
         - joint_limit_penalty
@@ -344,6 +358,7 @@ def _get_rewards_eureka(self):
         "stance_balance_reward": stance_balance_reward,
         "lateral_penalty": lateral_penalty,
         "backward_penalty": backward_penalty,
+        "roll_pitch_rate_penalty": roll_pitch_rate_penalty,
         "joint_motion_penalty": joint_motion_penalty,
         "joint_acc_penalty": joint_acc_penalty,
         "joint_limit_penalty": joint_limit_penalty,
