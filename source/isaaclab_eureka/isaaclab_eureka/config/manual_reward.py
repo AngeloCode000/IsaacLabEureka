@@ -1,15 +1,8 @@
 def _get_rewards_eureka(self):
-    """Simplified reward: strongly incentivize commanded forward velocity.
-
-    Rationale:
-    - Policy tends to stay in place; we boost forward-velocity tracking and add a
-      direct linear velocity bonus in commanded direction.
-    - Simplify shaping: keep small upright term; soften lateral/backward and
-      joint smoothness penalties; drop stance/contact shaping to avoid distracting
-      gradients.
+    """Reward with strong commanded forward velocity tracking plus
+    stability, pose, and smoothness shaping in the spirit of Sarrocco/Bertelli.
     """
     import torch
-
     from isaaclab.utils.math import quat_apply, quat_apply_inverse, yaw_quat
 
     device = self.device
@@ -17,6 +10,8 @@ def _get_rewards_eureka(self):
 
     robot = self.scene["robot"]
     root_lin_vel_w = robot.data.root_lin_vel_w
+    root_ang_vel_w = robot.data.root_ang_vel_w  # NEW: for yaw-rate tracking
+    root_pos_w = robot.data.root_pos_w          # NEW: for height tracking
     root_quat_w = robot.data.root_quat_w
     yaw_only_quat = yaw_quat(root_quat_w)
 
@@ -27,7 +22,9 @@ def _get_rewards_eureka(self):
     chassis_orientation = observations["chassis_orientation"]
     step_dt = float(getattr(self, "step_dt", 0.02)) or 0.02
 
-    # Pull the commanded velocity, falling back to the command manager if needed.
+    # ---------------------------------------------------------------------
+    # Command handling (linear velocity command)
+    # ---------------------------------------------------------------------
     desired_velocity = observations.get("desired_velocity")
     if desired_velocity is None and getattr(self, "command_manager", None) is not None:
         desired_velocity = self.command_manager.get_command("base_velocity")
@@ -51,18 +48,19 @@ def _get_rewards_eureka(self):
     desired_forward = command_body[..., 0]
     command_speed_scalar = torch.abs(desired_forward)
 
-    # Track the commanded forward velocity with a sharper peak and add a
-    # direct linear bonus along commanded direction.
+    # ---------------------------------------------------------------------
+    # 1) Linear velocity tracking (blog-style exponential + your bonus)
+    # ---------------------------------------------------------------------
     speed_tolerance = torch.clamp(0.3 + 0.3 * command_speed_scalar, min=0.3)
     speed_error = current_forward - desired_forward
     forward_tracking_reward = torch.exp(-0.5 * torch.square(speed_error / speed_tolerance))
-    # Strong weight on tracking; strictly zero if command is near-zero to avoid drift bias
+
     forward_gain = torch.where(
         command_speed_scalar > 0.2,
         torch.full_like(command_speed_scalar, 8.0),
         torch.zeros_like(command_speed_scalar),
     )
-    # Linear bonus in the commanded direction (sign-aware)
+
     commanded_dir = torch.sign(desired_forward)
     aligned_speed = commanded_dir * current_forward
     speed_bonus = torch.where(
@@ -72,24 +70,63 @@ def _get_rewards_eureka(self):
     )
     forward_reward = forward_gain * forward_tracking_reward + speed_bonus
 
-    # Penalise sideways and backward motion in the body frame.
+    # ---------------------------------------------------------------------
+    # 2) Angular velocity tracking (blog: exp(-(w_ref - w)^2))
+    # ---------------------------------------------------------------------
+    current_yaw_rate = root_ang_vel_w[..., 2]
+
+    desired_ang_vel = observations.get("desired_ang_vel", None)
+    if desired_ang_vel is None:
+        cmd_mgr = getattr(self, "command_manager", None)
+        if cmd_mgr is not None:
+            get_command = getattr(cmd_mgr, "get_command", None)
+            if get_command is not None:
+                try:
+                    desired_ang_vel = get_command("base_ang_velocity")
+                except KeyError:
+                    try:
+                        desired_ang_vel = get_command("base_velocity")
+                    except KeyError:
+                        desired_ang_vel = None
+
+    if desired_ang_vel is None:
+        desired_yaw_rate = torch.zeros_like(current_yaw_rate)
+    else:
+        desired_ang_vel = desired_ang_vel.to(device)
+        if desired_ang_vel.shape[-1] >= 3:
+            desired_yaw_rate = desired_ang_vel[..., 2]
+        else:
+            # Fallback: treat scalar/1D as yaw rate
+            desired_yaw_rate = desired_ang_vel[..., 0]
+
+    yaw_error = current_yaw_rate - desired_yaw_rate
+    yaw_tolerance = 0.5
+    ang_vel_tracking_reward = torch.exp(-0.5 * torch.square(yaw_error / yaw_tolerance))
+    ang_vel_reward = 1.5 * ang_vel_tracking_reward  # weight; tune as needed
+
+    # ---------------------------------------------------------------------
+    # 3) Penalise sideways and backward motion in the body frame.
+    # ---------------------------------------------------------------------
     lateral_weight = torch.where(
         command_speed_scalar > 0.2,
         torch.full_like(command_speed_scalar, 0.8),
         torch.full_like(command_speed_scalar, 0.4),
     )
     lateral_penalty = lateral_weight * torch.abs(current_lateral)
-    # Small penalty for motion opposite to command (zero when no command)
+
     backward_penalty = torch.where(
         command_speed_scalar > 0.2,
         0.6 * torch.relu(-aligned_speed),
         torch.zeros_like(aligned_speed),
     )
 
-    # Encourage aligning the robot's forward axis with the commanded heading when the command is meaningful.
+    # ---------------------------------------------------------------------
+    # 4) Heading alignment (directional tracking in world XY)
+    # ---------------------------------------------------------------------
     forward_axis_body = torch.zeros_like(root_lin_vel_w)
     forward_axis_body[..., 0] = 1.0
     forward_axis_world = quat_apply(yaw_only_quat, forward_axis_body)[..., :2]
+
     command_xy = desired_velocity[..., :2]
     command_speed_heading = torch.linalg.norm(command_xy, dim=-1, keepdim=True)
     command_dir_world = torch.where(
@@ -105,20 +142,61 @@ def _get_rewards_eureka(self):
         torch.zeros_like(heading_alignment),
     )
 
+    # ---------------------------------------------------------------------
+    # 5) Upright stability & roll/pitch-style shaping
+    # ---------------------------------------------------------------------
     upright_error = torch.linalg.norm(chassis_orientation[..., :2], dim=-1)
     upright_tolerance = 0.3
     balance_reward = 0.5 * torch.clamp(1.0 - upright_error / upright_tolerance, min=0.0)
 
-    # Gentle encouragement: keep base Z-axis parallel with gravity (body parallel to ground).
-    # Compute base Z-axis in world frame and reward its alignment with world Z (sign-agnostic).
-    # This is intentionally small so it cannot outweigh velocity/stability terms.
+    # Gentle encouragement: base Z-axis parallel to world Z.
     z_axis_body = torch.zeros_like(root_lin_vel_w)
     z_axis_body[..., 2] = 1.0
     base_z_world = quat_apply(root_quat_w, z_axis_body)[..., :3]
     z_alignment = torch.abs(base_z_world[..., 2])  # 1.0 when parallel to +/- world Z
     z_parallel_reward = 0.15 * z_alignment
 
-    # Softer joint smoothness penalties so they don't dominate
+    # ---------------------------------------------------------------------
+    # 6) Height tracking (blog: (z - z_ref)^2 penalty)
+    # ---------------------------------------------------------------------
+    base_height = root_pos_w[..., 2]
+
+    desired_height = observations.get("desired_height", None)
+    if desired_height is None:
+        # Fallback: use a default height if defined, else the current mean.
+        default_h = getattr(self, "default_base_height", None)
+        if default_h is None:
+            default_h = float(base_height.mean().detach())
+        desired_height = torch.full_like(base_height, default_h, device=device)
+    else:
+        desired_height = desired_height.to(device).squeeze(-1)
+
+    height_error = base_height - desired_height
+    height_penalty = 1.0 * torch.square(height_error)  # tune weight
+
+    # ---------------------------------------------------------------------
+    # 7) Vertical velocity penalty (blog: v_z^2)
+    # ---------------------------------------------------------------------
+    vertical_vel = root_lin_vel_w[..., 2]
+    vertical_vel_penalty = 0.1 * torch.square(vertical_vel)  # tune weight
+
+    # ---------------------------------------------------------------------
+    # 8) Pose similarity penalty (blog: ||q - q_default||^2)
+    # ---------------------------------------------------------------------
+    default_joint_positions = observations.get("default_joint_positions", None)
+    if default_joint_positions is None:
+        default_joint_positions = getattr(self, "default_joint_positions", None)
+
+    pose_penalty = torch.zeros(self.num_envs, device=device)
+    if default_joint_positions is not None:
+        default_joint_positions = default_joint_positions.to(device)
+        pose_penalty = 0.05 * torch.mean(
+            torch.square(joint_positions - default_joint_positions), dim=-1
+        )  # tune weight
+
+    # ---------------------------------------------------------------------
+    # 9) Joint smoothness (velocity + acc penalties)
+    # ---------------------------------------------------------------------
     smooth_scale = torch.where(
         command_speed_scalar < 0.3,
         torch.full_like(command_speed_scalar, 1.0),
@@ -136,23 +214,130 @@ def _get_rewards_eureka(self):
     excess_lower = torch.relu(joint_limit_lower - joint_positions)
     joint_limit_penalty = 0.2 * (excess_upper + excess_lower).sum(dim=-1)
 
-    # Drop contact/stance shaping to simplify signal
+    # ---------------------------------------------------------------------
+    # 10) Explicit action-rate penalty (blog: ||a_t - a_{t-1}||^2)
+    # ---------------------------------------------------------------------
+    action_rate_penalty = torch.zeros(self.num_envs, device=device)
+    actions = getattr(self, "actions", None)
+    if actions is not None:
+        actions = actions.to(device)
+        if not hasattr(self, "_prev_actions"):
+            self._prev_actions = torch.zeros_like(actions)
+        action_delta = actions - self._prev_actions
+        action_rate_penalty = 0.001 * torch.mean(torch.square(action_delta), dim=-1)
+        self._prev_actions = actions.detach().clone()
+
+    # ---------------------------------------------------------------------
+    # 11) Non-foot contact penalty (anti knee-crawling)
+    # ---------------------------------------------------------------------
+    if not hasattr(self, "_debug_contact_once"):
+        obs_contact_keys = [k for k in observations.keys() if "contact" in k or "force" in k]
+        data_contact_keys = [k for k in dir(robot.data) if "contact" in k or "force" in k]
+        print("obs contact-ish keys:", obs_contact_keys)
+        print("robot.data contact-ish keys:", data_contact_keys)
+        self._debug_contact_once = True
+
     contact_penalty = torch.zeros(self.num_envs, device=device)
+    contact_forces = None
+    contact_sensor = getattr(self.scene, "contact_forces", None)
+    if contact_sensor is None and hasattr(self.scene, "sensors"):
+        contact_sensor = self.scene.sensors.get("contact_forces", None)
+    if contact_sensor is not None:
+        try:
+            contact_forces = contact_sensor.data.net_forces_w
+            if not hasattr(self, "_foot_body_ids"):
+                body_names = contact_sensor.body_names
+                if not hasattr(self, "_logged_contact_names"):
+                    print("contact sensor body names:", body_names)
+                    self._logged_contact_names = True
+                foot_ids, _ = contact_sensor.find_bodies(
+                    [
+                        ".*_foot.*",
+                        ".*foot.*",
+                        ".*toe.*",
+                        ".*FOOT.*",
+                        ".*Toe.*",
+                    ]
+                )
+                self._foot_body_ids = [int(i) for i in foot_ids]
+                if not hasattr(self, "_logged_resolved_feet"):
+                    print("resolved foot ids:", self._foot_body_ids)
+                    self._logged_resolved_feet = True
+        except Exception:
+            contact_forces = None
+
+    if contact_forces is None:
+        contact_force_keys = (
+            "contact_forces_w",
+            "net_contact_forces_w",
+            "contact_forces",
+            "net_contact_forces",
+            "contact_force_w",
+            "contact_force",
+        )
+        for key in contact_force_keys:
+            if key in observations and observations[key] is not None:
+                contact_forces = observations[key]
+                break
+            value = getattr(robot.data, key, None)
+            if value is not None:
+                contact_forces = value
+                break
+
+    if contact_forces is not None and contact_forces.dim() >= 3 and contact_forces.numel() > 0:
+        force_mag = torch.linalg.norm(contact_forces[..., :3], dim=-1)
+        num_bodies = force_mag.shape[1] if force_mag.dim() > 1 else 0
+        foot_indices = None
+        if hasattr(self, "_foot_body_ids"):
+            foot_indices = self._foot_body_ids
+        else:
+            for attr in ("foot_indices", "feet_indices", "feet_ids", "foot_ids", "foot_links"):
+                candidate = getattr(self, attr, None)
+                if candidate is not None:
+                    try:
+                        foot_indices = [int(i) for i in candidate]
+                    except TypeError:
+                        pass
+                    break
+        if num_bodies > 0:
+            valid_feet = []
+            if foot_indices is not None:
+                valid_feet = [i for i in foot_indices if 0 <= i < num_bodies]
+            if valid_feet:
+                body_mask = torch.ones(num_bodies, dtype=torch.bool, device=device)
+                body_mask[torch.tensor(valid_feet, device=device)] = False
+                non_foot_forces = force_mag[:, body_mask]
+            else:
+                non_foot_forces = force_mag
+            contact_penalty = 0.02 * non_foot_forces.sum(dim=-1)
+
     stance_balance_reward = torch.zeros(self.num_envs, device=device)
 
+    # ---------------------------------------------------------------------
+    # Total reward aggregation
+    # ---------------------------------------------------------------------
     total_reward = (
         forward_reward
+        + ang_vel_reward
         + heading_reward
         + balance_reward
         + z_parallel_reward
+        + stance_balance_reward
+        - contact_penalty
         - joint_motion_penalty
         - joint_acc_penalty
         - joint_limit_penalty
         - lateral_penalty
         - backward_penalty
+        - height_penalty
+        - vertical_vel_penalty
+        - pose_penalty
+        - action_rate_penalty
     )
+
     rewards_dict = {
         "forward_reward": forward_reward,
+        "ang_vel_reward": ang_vel_reward,
         "heading_reward": heading_reward,
         "balance_reward": balance_reward,
         "z_parallel_reward": z_parallel_reward,
@@ -163,5 +348,9 @@ def _get_rewards_eureka(self):
         "joint_acc_penalty": joint_acc_penalty,
         "joint_limit_penalty": joint_limit_penalty,
         "non_foot_contact_penalty": contact_penalty,
+        "height_penalty": height_penalty,
+        "vertical_vel_penalty": vertical_vel_penalty,
+        "pose_penalty": pose_penalty,
+        "action_rate_penalty": action_rate_penalty,
     }
     return total_reward.to(device), {k: v.to(device) for k, v in rewards_dict.items()}

@@ -164,6 +164,8 @@ class EurekaTaskManager:
             then falls back to common buffers.
             Returns a dict-like object suitable for Eureka's prompt context.
             """
+            import torch
+
             # 1) If the env already has a public getter
             if hasattr(self_, "get_observations"):
                 try:
@@ -245,8 +247,31 @@ class EurekaTaskManager:
                                 observations["joint_angles"] = joint_pos_abs
                                 observations["joint_positions"] = joint_pos_abs
                             default_joint_pos = getattr(data, "default_joint_pos", None) if data is not None else None
-                            if default_joint_pos is not None:
-                                observations["joint_default_pos"] = default_joint_pos
+                        if default_joint_pos is not None:
+                            observations["joint_default_pos"] = default_joint_pos
+
+                        # Provide a default desired height for reward code if missing.
+                        target_height = None
+                        if "desired_height" in observations and observations["desired_height"] is not None:
+                            target_height = observations["desired_height"]
+                        else:
+                            target_height = getattr(self_, "default_base_height", None)
+                            if target_height is None and robot_asset is not None:
+                                init_state = getattr(robot_asset, "init_state", None)
+                                if init_state is not None:
+                                    pos = getattr(init_state, "pos", None)
+                                    if pos is not None and len(pos) >= 3:
+                                        try:
+                                            target_height = float(pos[2])
+                                        except (TypeError, ValueError):
+                                            target_height = None
+                        if target_height is not None and "desired_height" not in observations:
+                            try:
+                                observations["desired_height"] = torch.full(
+                                    (self_.num_envs,), float(target_height), device=self_.device
+                                )
+                            except Exception:
+                                pass
 
                         if observations:
                             return observations
