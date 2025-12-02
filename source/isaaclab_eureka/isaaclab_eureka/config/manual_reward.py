@@ -163,7 +163,7 @@ def _get_rewards_eureka(self):
     # 5) Upright stability & roll/pitch-style shaping
     # ---------------------------------------------------------------------
     upright_error = torch.linalg.norm(chassis_orientation[..., :2], dim=-1)
-    balance_reward = 0.8 * torch.exp(-0.5 * torch.square(upright_error / 0.25))
+    balance_reward = 1.0 * torch.exp(-0.5 * torch.square(upright_error / 0.25))
 
     # Gentle encouragement: base Z-axis parallel to world Z.
     z_axis_body = torch.zeros_like(root_lin_vel_w)
@@ -187,10 +187,26 @@ def _get_rewards_eureka(self):
     else:
         desired_height = desired_height.to(device).squeeze(-1)
 
+    # Height tracking and strong low-height penalty
     height_error = base_height - desired_height
-    height_penalty = 2.0 * torch.square(height_error)  # tune weight
-    collapse_target = 0.85 * torch.clamp(desired_height, min=0.25)
-    collapse_penalty = 4.0 * torch.relu(collapse_target - base_height)
+
+    # Keep this relatively mild so it doesn't dominate stepping behavior
+    height_penalty = 1.0 * torch.square(height_error)
+
+    # Strong punishment for being significantly below desired trot height.
+    # margin: how far below desired_height we start calling it "collapsing"
+    collapse_margin = 0.04  # ~4 cm below desired height; tune to the robot
+
+    collapse_target = torch.clamp(desired_height - collapse_margin, min=0.20)
+    collapse_depth = torch.relu(collapse_target - base_height)
+
+    # Make this big enough to matter relative to ~100+ forward reward.
+    collapse_penalty = 200.0 * collapse_depth
+
+    # Mask out locomotion rewards when the base is clearly below trot height.
+    upright_mask = torch.where(base_height > collapse_target, torch.ones_like(base_height), torch.zeros_like(base_height))
+    forward_reward = forward_reward * upright_mask
+    progress_reward = progress_reward * upright_mask
 
     # ---------------------------------------------------------------------
     # 7) Vertical velocity penalty (blog: v_z^2)
@@ -248,6 +264,27 @@ def _get_rewards_eureka(self):
     joint_limit_penalty = 0.3 * (excess_upper + excess_lower).sum(dim=-1)
 
     # ---------------------------------------------------------------------
+    # 9b) Knee pose penalty to discourage deep crouch / knee-crawling
+    # ---------------------------------------------------------------------
+    # TODO: replace these indices with the actual knee joint indices for this robot
+    K0, K1, K2, K3 = 0, 1, 2, 3
+    knee_joint_indices = torch.tensor([K0, K1, K2, K3], device=device, dtype=torch.long)
+
+    # Select knee angles: shape [num_envs, num_knees]
+    knee_angles = joint_positions[:, knee_joint_indices]
+
+    # Choose a "too bent" threshold in radians.
+    # Example: if standing knees are ~0.6 rad and crawling is > 1.2 rad,
+    # set threshold somewhere around 0.9–1.0.
+    kneel_thresh = 1.0
+
+    # Penalize only the excess beyond this threshold
+    knee_flex_excess = torch.relu(torch.abs(knee_angles) - kneel_thresh)
+
+    # Weight so that staying in a deep crouch is clearly worse than standing.
+    knee_pose_penalty = 6.0 * knee_flex_excess.mean(dim=-1)
+
+    # ---------------------------------------------------------------------
     # 10) Explicit action-rate penalty (blog: ||a_t - a_{t-1}||^2)
     # ---------------------------------------------------------------------
     action_rate_penalty = torch.zeros(self.num_envs, device=device)
@@ -268,122 +305,11 @@ def _get_rewards_eureka(self):
         self._prev_action_delta = action_delta_clipped.detach().clone()
 
     # ---------------------------------------------------------------------
-    # 11) Non-foot contact penalty (anti knee-crawling)
+    # 11) Non-foot / knee contact logic (temporarily disabled: no sensors wired)
     # ---------------------------------------------------------------------
-    if not hasattr(self, "_debug_contact_once"):
-        obs_contact_keys = [k for k in observations.keys() if "contact" in k or "force" in k]
-        data_contact_keys = [k for k in dir(robot.data) if "contact" in k or "force" in k]
-        print("obs contact-ish keys:", obs_contact_keys)
-        print("robot.data contact-ish keys:", data_contact_keys)
-        self._debug_contact_once = True
-
     contact_penalty = torch.zeros(self.num_envs, device=device)
     knee_contact_penalty = torch.zeros(self.num_envs, device=device)
     stance_balance_reward = torch.zeros(self.num_envs, device=device)
-    contact_forces = None
-    force_mag = None
-    valid_feet = []
-    contact_sensor = getattr(self.scene, "contact_forces", None)
-    if contact_sensor is None and hasattr(self.scene, "sensors"):
-        contact_sensor = self.scene.sensors.get("contact_forces", None)
-    if contact_sensor is not None:
-        try:
-            contact_forces = contact_sensor.data.net_forces_w
-            if not hasattr(self, "_foot_body_ids"):
-                body_names = contact_sensor.body_names
-                if not hasattr(self, "_logged_contact_names"):
-                    print("contact sensor body names:", body_names)
-                    self._logged_contact_names = True
-                foot_ids, _ = contact_sensor.find_bodies(
-                    [
-                        ".*_foot.*",
-                        ".*foot.*",
-                        ".*toe.*",
-                        ".*FOOT.*",
-                        ".*Toe.*",
-                    ]
-                )
-                self._foot_body_ids = [int(i) for i in foot_ids]
-                knee_ids, _ = contact_sensor.find_bodies(
-                    [
-                        ".*knee.*",
-                        ".*thigh.*",
-                        ".*shin.*",
-                        ".*shank.*",
-                        ".*calf.*",
-                    ]
-                )
-                self._knee_body_ids = [int(i) for i in knee_ids if int(i) not in self._foot_body_ids]
-                if not hasattr(self, "_logged_resolved_feet"):
-                    print("resolved foot ids:", self._foot_body_ids)
-                    self._logged_resolved_feet = True
-                if not hasattr(self, "_logged_resolved_knees"):
-                    print("resolved knee ids:", getattr(self, "_knee_body_ids", []))
-                    self._logged_resolved_knees = True
-        except Exception:
-            contact_forces = None
-
-    if contact_forces is None:
-        contact_force_keys = (
-            "contact_forces_w",
-            "net_contact_forces_w",
-            "contact_forces",
-            "net_contact_forces",
-            "contact_force_w",
-            "contact_force",
-        )
-        for key in contact_force_keys:
-            if key in observations and observations[key] is not None:
-                contact_forces = observations[key]
-                break
-            value = getattr(robot.data, key, None)
-            if value is not None:
-                contact_forces = value
-                break
-
-    if contact_forces is not None and contact_forces.dim() >= 3 and contact_forces.numel() > 0:
-        force_mag = torch.linalg.norm(contact_forces[..., :3], dim=-1)
-        num_bodies = force_mag.shape[1] if force_mag.dim() > 1 else 0
-        foot_indices = None
-        if hasattr(self, "_foot_body_ids"):
-            foot_indices = self._foot_body_ids
-        else:
-            for attr in ("foot_indices", "feet_indices", "feet_ids", "foot_ids", "foot_links"):
-                candidate = getattr(self, attr, None)
-                if candidate is not None:
-                    try:
-                        foot_indices = [int(i) for i in candidate]
-                    except TypeError:
-                        pass
-                    break
-        if num_bodies > 0:
-            if foot_indices is not None:
-                valid_feet = [i for i in foot_indices if 0 <= i < num_bodies]
-            if valid_feet:
-                body_mask = torch.ones(num_bodies, dtype=torch.bool, device=device)
-                body_mask[torch.tensor(valid_feet, device=device)] = False
-                non_foot_forces = force_mag[:, body_mask]
-            else:
-                non_foot_forces = force_mag
-            contact_penalty = 0.03 * non_foot_forces.sum(dim=-1)
-
-            if valid_feet:
-                foot_ids_tensor = torch.as_tensor(valid_feet, device=device, dtype=torch.long)
-                foot_forces = force_mag[:, foot_ids_tensor]
-                stance_contacts = (foot_forces > 5.0).float()
-                stance_count = stance_contacts.sum(dim=-1)
-                stance_balance_reward = 0.1 * torch.exp(
-                    -0.5 * torch.square((stance_count - 2.5) / 1.0)
-                )
-            knee_indices = None
-            if hasattr(self, "_knee_body_ids"):
-                knee_indices = [i for i in self._knee_body_ids if 0 <= i < num_bodies]
-            if knee_indices:
-                knee_ids_tensor = torch.as_tensor(knee_indices, device=device, dtype=torch.long)
-                knee_forces = force_mag[:, knee_ids_tensor]
-                knee_force_excess = torch.relu(knee_forces - 5.0)
-                knee_contact_penalty = 0.06 * knee_force_excess.sum(dim=-1)
-
     # ---------------------------------------------------------------------
     # Total reward aggregation
     # ---------------------------------------------------------------------
@@ -393,9 +319,8 @@ def _get_rewards_eureka(self):
         + heading_reward
         + balance_reward
         + z_parallel_reward
-        + stance_balance_reward
-        - contact_penalty
-        - knee_contact_penalty
+        # stance_balance_reward removed (currently always zero / disabled)
+        # contact_penalty and knee_contact_penalty removed (no sensors wired)
         - roll_pitch_rate_penalty
         - base_acc_penalty
         - base_ang_acc_penalty
@@ -411,6 +336,7 @@ def _get_rewards_eureka(self):
         - action_rate_penalty
         - action_jerk_penalty
         - stalled_penalty
+        - knee_pose_penalty
         + progress_reward
     )
 
@@ -422,7 +348,6 @@ def _get_rewards_eureka(self):
         "heading_reward": heading_reward,
         "balance_reward": balance_reward,
         "z_parallel_reward": z_parallel_reward,
-        "stance_balance_reward": stance_balance_reward,
         "lateral_penalty": lateral_penalty,
         "backward_penalty": backward_penalty,
         "roll_pitch_rate_penalty": roll_pitch_rate_penalty,
@@ -431,13 +356,12 @@ def _get_rewards_eureka(self):
         "joint_motion_penalty": joint_motion_penalty,
         "joint_acc_penalty": joint_acc_penalty,
         "joint_limit_penalty": joint_limit_penalty,
-        "non_foot_contact_penalty": contact_penalty,
-        "knee_contact_penalty": knee_contact_penalty,
         "height_penalty": height_penalty,
         "collapse_penalty": collapse_penalty,
         "vertical_vel_penalty": vertical_vel_penalty,
         "pose_penalty": pose_penalty,
         "action_rate_penalty": action_rate_penalty,
         "action_jerk_penalty": action_jerk_penalty,
+        "knee_pose_penalty": knee_pose_penalty,
     }
     return total_reward.to(device), {k: v.to(device) for k, v in rewards_dict.items()}
