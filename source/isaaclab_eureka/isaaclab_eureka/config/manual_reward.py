@@ -163,14 +163,15 @@ def _get_rewards_eureka(self):
     # 5) Upright stability & roll/pitch-style shaping
     # ---------------------------------------------------------------------
     upright_error = torch.linalg.norm(chassis_orientation[..., :2], dim=-1)
-    balance_reward = 1.0 * torch.exp(-0.5 * torch.square(upright_error / 0.25))
+    balance_reward = 1.2 * torch.exp(-0.5 * torch.square(upright_error / 0.25))
 
     # Gentle encouragement: base Z-axis parallel to world Z.
     z_axis_body = torch.zeros_like(root_lin_vel_w)
     z_axis_body[..., 2] = 1.0
     base_z_world = quat_apply(root_quat_w, z_axis_body)[..., :3]
     z_alignment = torch.abs(base_z_world[..., 2])  # 1.0 when parallel to +/- world Z
-    z_parallel_reward = 0.25 * z_alignment
+    # Stronger encouragement to keep body Z aligned with world Z (parallel to ground).
+    z_parallel_reward = 0.6 * z_alignment
 
     # ---------------------------------------------------------------------
     # 6) Height tracking (blog: (z - z_ref)^2 penalty)
@@ -215,7 +216,7 @@ def _get_rewards_eureka(self):
     vertical_vel_penalty = 0.25 * torch.square(vertical_vel)  # tune weight
 
     # Penalise rapid roll/pitch angular rates that make the robot shake.
-    roll_pitch_rate_penalty = 0.2 * torch.linalg.norm(root_ang_vel_w[..., :2], dim=-1)
+    roll_pitch_rate_penalty = 0.25 * torch.linalg.norm(root_ang_vel_w[..., :2], dim=-1)
 
     # Encourage smooth base motion by penalising rapid changes in lin/ang velocity.
     if not hasattr(self, "_prev_root_lin_vel"):
@@ -223,8 +224,8 @@ def _get_rewards_eureka(self):
         self._prev_root_ang_vel = torch.zeros_like(root_ang_vel_w)
     root_lin_acc = (root_lin_vel_w - self._prev_root_lin_vel) / max(step_dt, 1e-3)
     root_ang_acc = (root_ang_vel_w - self._prev_root_ang_vel) / max(step_dt, 1e-3)
-    base_acc_penalty = 0.02 * torch.linalg.norm(root_lin_acc[..., :2], dim=-1)
-    base_ang_acc_penalty = 0.01 * torch.abs(root_ang_acc[..., 2])
+    base_acc_penalty = 0.03 * torch.linalg.norm(root_lin_acc[..., :2], dim=-1)
+    base_ang_acc_penalty = 0.015 * torch.abs(root_ang_acc[..., 2])
     self._prev_root_lin_vel = root_lin_vel_w.detach().clone()
     self._prev_root_ang_vel = root_ang_vel_w.detach().clone()
 
@@ -250,13 +251,13 @@ def _get_rewards_eureka(self):
         torch.full_like(command_speed_scalar, 1.2),
         torch.ones_like(command_speed_scalar),
     )
-    joint_motion_penalty = 0.01 * smooth_scale * torch.mean(torch.abs(joint_velocities), dim=-1)
+    joint_motion_penalty = 0.015 * smooth_scale * torch.mean(torch.abs(joint_velocities), dim=-1)
 
     if not hasattr(self, "_prev_joint_velocities"):
         self._prev_joint_velocities = torch.zeros_like(joint_velocities)
     joint_acc = torch.abs(joint_velocities - self._prev_joint_velocities) / max(step_dt, 1e-3)
     joint_acc_clipped = torch.clamp(joint_acc, max=200.0)
-    joint_acc_penalty = 0.003 * smooth_scale * torch.mean(joint_acc_clipped, dim=-1)
+    joint_acc_penalty = 0.004 * smooth_scale * torch.mean(joint_acc_clipped, dim=-1)
     self._prev_joint_velocities = joint_velocities.detach().clone()
 
     excess_upper = torch.relu(joint_positions - joint_limit_upper)
@@ -298,9 +299,9 @@ def _get_rewards_eureka(self):
             self._prev_action_delta = torch.zeros_like(actions)
         action_delta = actions - self._prev_actions
         action_delta_clipped = torch.clamp(action_delta, min=-2.0, max=2.0)
-        action_rate_penalty = 0.01 * torch.mean(torch.square(action_delta_clipped), dim=-1)
+        action_rate_penalty = 0.015 * torch.mean(torch.square(action_delta_clipped), dim=-1)
         action_jerk = (action_delta_clipped - self._prev_action_delta) / max(step_dt, 1e-3)
-        action_jerk_penalty = 0.002 * torch.mean(torch.abs(action_jerk), dim=-1)
+        action_jerk_penalty = 0.003 * torch.mean(torch.abs(action_jerk), dim=-1)
         self._prev_actions = actions.detach().clone()
         self._prev_action_delta = action_delta_clipped.detach().clone()
 
@@ -364,4 +365,8 @@ def _get_rewards_eureka(self):
         "action_jerk_penalty": action_jerk_penalty,
         "knee_pose_penalty": knee_pose_penalty,
     }
+
+    # Drop metrics that are identically zero to avoid noisy logging.
+    rewards_dict = {k: v for k, v in rewards_dict.items() if not torch.all(v == 0)}
+
     return total_reward.to(device), {k: v.to(device) for k, v in rewards_dict.items()}
