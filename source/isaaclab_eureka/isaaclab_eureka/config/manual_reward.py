@@ -51,7 +51,7 @@ def _get_rewards_eureka(self):
     # ---------------------------------------------------------------------
     # 1) Linear velocity tracking (blog-style exponential + your bonus)
     # ---------------------------------------------------------------------
-    speed_tolerance = torch.clamp(0.3 + 0.3 * command_speed_scalar, min=0.3)
+    speed_tolerance = torch.clamp(0.2 + 0.2 * command_speed_scalar, min=0.2)
     speed_error = current_forward - desired_forward
     forward_tracking_reward = torch.exp(-0.5 * torch.square(speed_error / speed_tolerance))
 
@@ -69,6 +69,23 @@ def _get_rewards_eureka(self):
         0.25 * torch.relu(aligned_speed),
     )
     forward_reward = forward_gain * forward_tracking_reward + speed_bonus
+
+    # Additional drive term to favor actually moving when commanded.
+    normalized_speed = torch.where(
+        command_speed_scalar > 0.1,
+        torch.relu(aligned_speed) / torch.clamp(command_speed_scalar, min=0.1),
+        torch.zeros_like(aligned_speed),
+    )
+    progress_reward = torch.where(
+        command_speed_scalar > 0.1,
+        4.0 * torch.clamp(normalized_speed, max=2.0),
+        torch.zeros_like(normalized_speed),
+    )
+    stalled_penalty = torch.where(
+        command_speed_scalar > 0.4,
+        2.5 * torch.relu(0.6 - normalized_speed),
+        torch.zeros_like(normalized_speed),
+    )
 
     # ---------------------------------------------------------------------
     # 2) Angular velocity tracking (blog: exp(-(w_ref - w)^2))
@@ -172,6 +189,8 @@ def _get_rewards_eureka(self):
 
     height_error = base_height - desired_height
     height_penalty = 2.0 * torch.square(height_error)  # tune weight
+    collapse_target = 0.85 * torch.clamp(desired_height, min=0.25)
+    collapse_penalty = 4.0 * torch.relu(collapse_target - base_height)
 
     # ---------------------------------------------------------------------
     # 7) Vertical velocity penalty (blog: v_z^2)
@@ -181,6 +200,17 @@ def _get_rewards_eureka(self):
 
     # Penalise rapid roll/pitch angular rates that make the robot shake.
     roll_pitch_rate_penalty = 0.2 * torch.linalg.norm(root_ang_vel_w[..., :2], dim=-1)
+
+    # Encourage smooth base motion by penalising rapid changes in lin/ang velocity.
+    if not hasattr(self, "_prev_root_lin_vel"):
+        self._prev_root_lin_vel = torch.zeros_like(root_lin_vel_w)
+        self._prev_root_ang_vel = torch.zeros_like(root_ang_vel_w)
+    root_lin_acc = (root_lin_vel_w - self._prev_root_lin_vel) / max(step_dt, 1e-3)
+    root_ang_acc = (root_ang_vel_w - self._prev_root_ang_vel) / max(step_dt, 1e-3)
+    base_acc_penalty = 0.02 * torch.linalg.norm(root_lin_acc[..., :2], dim=-1)
+    base_ang_acc_penalty = 0.01 * torch.abs(root_ang_acc[..., 2])
+    self._prev_root_lin_vel = root_lin_vel_w.detach().clone()
+    self._prev_root_ang_vel = root_ang_vel_w.detach().clone()
 
     # ---------------------------------------------------------------------
     # 8) Pose similarity penalty (blog: ||q - q_default||^2)
@@ -221,15 +251,21 @@ def _get_rewards_eureka(self):
     # 10) Explicit action-rate penalty (blog: ||a_t - a_{t-1}||^2)
     # ---------------------------------------------------------------------
     action_rate_penalty = torch.zeros(self.num_envs, device=device)
+    action_jerk_penalty = torch.zeros(self.num_envs, device=device)
     actions = getattr(self, "actions", None)
     if actions is not None:
         actions = actions.to(device)
         if not hasattr(self, "_prev_actions"):
             self._prev_actions = torch.zeros_like(actions)
+        if not hasattr(self, "_prev_action_delta"):
+            self._prev_action_delta = torch.zeros_like(actions)
         action_delta = actions - self._prev_actions
         action_delta_clipped = torch.clamp(action_delta, min=-2.0, max=2.0)
         action_rate_penalty = 0.01 * torch.mean(torch.square(action_delta_clipped), dim=-1)
+        action_jerk = (action_delta_clipped - self._prev_action_delta) / max(step_dt, 1e-3)
+        action_jerk_penalty = 0.002 * torch.mean(torch.abs(action_jerk), dim=-1)
         self._prev_actions = actions.detach().clone()
+        self._prev_action_delta = action_delta_clipped.detach().clone()
 
     # ---------------------------------------------------------------------
     # 11) Non-foot contact penalty (anti knee-crawling)
@@ -242,6 +278,7 @@ def _get_rewards_eureka(self):
         self._debug_contact_once = True
 
     contact_penalty = torch.zeros(self.num_envs, device=device)
+    knee_contact_penalty = torch.zeros(self.num_envs, device=device)
     stance_balance_reward = torch.zeros(self.num_envs, device=device)
     contact_forces = None
     force_mag = None
@@ -267,9 +304,22 @@ def _get_rewards_eureka(self):
                     ]
                 )
                 self._foot_body_ids = [int(i) for i in foot_ids]
+                knee_ids, _ = contact_sensor.find_bodies(
+                    [
+                        ".*knee.*",
+                        ".*thigh.*",
+                        ".*shin.*",
+                        ".*shank.*",
+                        ".*calf.*",
+                    ]
+                )
+                self._knee_body_ids = [int(i) for i in knee_ids if int(i) not in self._foot_body_ids]
                 if not hasattr(self, "_logged_resolved_feet"):
                     print("resolved foot ids:", self._foot_body_ids)
                     self._logged_resolved_feet = True
+                if not hasattr(self, "_logged_resolved_knees"):
+                    print("resolved knee ids:", getattr(self, "_knee_body_ids", []))
+                    self._logged_resolved_knees = True
         except Exception:
             contact_forces = None
 
@@ -325,6 +375,14 @@ def _get_rewards_eureka(self):
                 stance_balance_reward = 0.1 * torch.exp(
                     -0.5 * torch.square((stance_count - 2.5) / 1.0)
                 )
+            knee_indices = None
+            if hasattr(self, "_knee_body_ids"):
+                knee_indices = [i for i in self._knee_body_ids if 0 <= i < num_bodies]
+            if knee_indices:
+                knee_ids_tensor = torch.as_tensor(knee_indices, device=device, dtype=torch.long)
+                knee_forces = force_mag[:, knee_ids_tensor]
+                knee_force_excess = torch.relu(knee_forces - 5.0)
+                knee_contact_penalty = 0.06 * knee_force_excess.sum(dim=-1)
 
     # ---------------------------------------------------------------------
     # Total reward aggregation
@@ -337,21 +395,30 @@ def _get_rewards_eureka(self):
         + z_parallel_reward
         + stance_balance_reward
         - contact_penalty
+        - knee_contact_penalty
         - roll_pitch_rate_penalty
+        - base_acc_penalty
+        - base_ang_acc_penalty
         - joint_motion_penalty
         - joint_acc_penalty
         - joint_limit_penalty
         - lateral_penalty
         - backward_penalty
         - height_penalty
+        - collapse_penalty
         - vertical_vel_penalty
         - pose_penalty
         - action_rate_penalty
+        - action_jerk_penalty
+        - stalled_penalty
+        + progress_reward
     )
 
     rewards_dict = {
         "forward_reward": forward_reward,
         "ang_vel_reward": ang_vel_reward,
+        "progress_reward": progress_reward,
+        "stalled_penalty": stalled_penalty,
         "heading_reward": heading_reward,
         "balance_reward": balance_reward,
         "z_parallel_reward": z_parallel_reward,
@@ -359,13 +426,18 @@ def _get_rewards_eureka(self):
         "lateral_penalty": lateral_penalty,
         "backward_penalty": backward_penalty,
         "roll_pitch_rate_penalty": roll_pitch_rate_penalty,
+        "base_acc_penalty": base_acc_penalty,
+        "base_ang_acc_penalty": base_ang_acc_penalty,
         "joint_motion_penalty": joint_motion_penalty,
         "joint_acc_penalty": joint_acc_penalty,
         "joint_limit_penalty": joint_limit_penalty,
         "non_foot_contact_penalty": contact_penalty,
+        "knee_contact_penalty": knee_contact_penalty,
         "height_penalty": height_penalty,
+        "collapse_penalty": collapse_penalty,
         "vertical_vel_penalty": vertical_vel_penalty,
         "pose_penalty": pose_penalty,
         "action_rate_penalty": action_rate_penalty,
+        "action_jerk_penalty": action_jerk_penalty,
     }
     return total_reward.to(device), {k: v.to(device) for k, v in rewards_dict.items()}
