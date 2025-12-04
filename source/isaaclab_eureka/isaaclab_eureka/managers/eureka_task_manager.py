@@ -21,13 +21,22 @@ import torch
 def _get_rewards(self):
     rewards_oracle = self._get_rewards_oracle()
     rewards_eureka, rewards_dict = self._get_rewards_eureka()
+
+    # Sanitize and gently clip to keep training stable.
+    rewards_oracle = torch.nan_to_num(rewards_oracle, nan=0.0, posinf=0.0, neginf=0.0)
+    rewards_eureka = torch.nan_to_num(rewards_eureka, nan=0.0, posinf=0.0, neginf=0.0)
+    rewards_eureka = torch.clamp(rewards_eureka, min=-100.0, max=100.0)
+
     self._eureka_episode_sums["eureka_total_rewards"] += rewards_eureka
     self._eureka_episode_sums["oracle_total_rewards"] += rewards_oracle
     for key in rewards_dict.keys():
         if key not in self._eureka_episode_sums:
             self._eureka_episode_sums[key] = torch.zeros(self.num_envs, device=self.device)
-        self._eureka_episode_sums[key] += rewards_dict[key]
-    return rewards_eureka
+        # Also sanitize logged components to avoid NaNs in summaries.
+        self._eureka_episode_sums[key] += torch.nan_to_num(rewards_dict[key], nan=0.0, posinf=0.0, neginf=0.0)
+    combined = rewards_oracle + rewards_eureka
+    combined = torch.clamp(combined, min=-1000.0, max=1000.0)
+    return combined
 """
 
 
@@ -108,6 +117,285 @@ class EurekaTaskManager:
 
         # Fetch the observations
         self._get_observations_as_string = self._observations_queue.get()
+
+    def _attach_direct_api_shims(self):
+        """
+        Ensure Direct Reinforcement Learning Environment (DirectRLEnv)-style hooks exist on Manager-Based
+        Reinforcement Learning Environment (ManagerBasedRLEnv) tasks so Eureka can run unchanged.
+
+        Always provides a Python-defined _get_observations() so inspect.getsource(...) works.
+        Also aliases/creates: _get_rewards, _get_dones, _reset_idx when missing.
+        """
+        import types
+        import torch
+
+        env = self._env.unwrapped
+
+        # ---------- OBSERVATIONS ----------
+        # We will ALWAYS install a Python function for _get_observations so inspect.getsource works.
+
+        def _get_robot_asset(self_):
+            """Return the primary articulated robot asset if it exists."""
+            scene = getattr(self_, "scene", None)
+            if scene is None:
+                return None
+            robot_entity = None
+            # Prefer dictionary-style access first to catch named entities.
+            get_item = getattr(scene, "__getitem__", None)
+            if callable(get_item):
+                try:
+                    robot_entity = scene["robot"]
+                except Exception:
+                    robot_entity = None
+            if robot_entity is None:
+                robot_entity = getattr(scene, "robot", None)
+            return robot_entity
+
+        def _fallback_obs_dict_from_buffers(self_):
+            """Try common buffer names and return a {'policy': tensor} dict if found, else None."""
+            for name in ("policy_obs_buf", "_policy_obs_buf", "obs_buf", "_obs_buf"):
+                if hasattr(self_, name) and getattr(self_, name) is not None:
+                    return {"policy": getattr(self_, name)}
+            return None
+
+        def _get_observations_synth(self_):
+            """
+            Synthesized observation fetcher that tries multiple Manager-based APIs,
+            then falls back to common buffers.
+            Returns a dict-like object suitable for Eureka's prompt context.
+            """
+            import torch
+
+            # 1) If the env already has a public getter
+            if hasattr(self_, "get_observations"):
+                try:
+                    return self_.get_observations()
+                except Exception:
+                    pass
+
+            # 2) Go through the observation manager if present
+            om = getattr(self_, "observation_manager", None)
+            if om is not None:
+                # Common pattern: om.get_observations()
+                if hasattr(om, "get_observations"):
+                    try:
+                        return om.get_observations()
+                    except Exception:
+                        pass
+                # Some stacks require compute() before pulling buffers
+                if hasattr(om, "compute"):
+                    try:
+                        obs_buffer = om.compute()
+                        observations = {}
+                        for group_name, term_names in om.active_terms.items():
+                            group_data = obs_buffer[group_name]
+                            if isinstance(group_data, dict):
+                                for name, value in group_data.items():
+                                    observations[name] = value
+                            else:
+                                # terms are concatenated: slice them back out
+                                idx = 0
+                                term_dims = om.group_obs_term_dim[group_name]
+                                for name, dims in zip(term_names, term_dims):
+                                    length = int(math.prod(dims))
+                                    term = group_data[:, idx : idx + length]
+                                    term = term.view(self_.num_envs, *dims)
+                                    # squeeze trailing singleton for 1D terms
+                                    if term.shape[-1] == 1 and len(dims) == 1:
+                                        term = term.squeeze(-1)
+                                    observations[name] = term
+                                    idx += length
+
+                        # Provide common aliases the LLM often expects.
+                        if "velocity_commands" in observations:
+                            observations["velocity_command"] = observations["velocity_commands"]
+                            observations["desired_velocity"] = observations["velocity_commands"]
+                        if "base_lin_vel" in observations:
+                            observations["current_velocity"] = observations["base_lin_vel"]
+                            observations["linear_velocity"] = observations["base_lin_vel"]
+                        if "joint_pos" in observations:
+                            observations["joint_pos_rel"] = observations["joint_pos"]
+                            observations.setdefault("joint_positions", observations["joint_pos"])
+                            observations.setdefault("joint_angles", observations["joint_pos"])
+                        if "joint_vel" in observations:
+                            observations["joint_velocities"] = observations["joint_vel"]
+                        if "projected_gravity" in observations:
+                            observations["chassis_orientation"] = observations["projected_gravity"]
+                            observations["base_orientation"] = observations["projected_gravity"]
+
+                        # Surface joint-state tensors so GPT rewards can work with absolute limits.
+                        robot_asset = _get_robot_asset(self_)
+                        if robot_asset is not None:
+                            data = getattr(robot_asset, "data", None)
+                            soft_limits = getattr(data, "soft_joint_pos_limits", None) if data is not None else None
+                            if soft_limits is not None:
+                                observations["joint_limit_lower"] = soft_limits[..., 0]
+                                observations["joint_limit_upper"] = soft_limits[..., 1]
+                            joint_pos_abs = getattr(data, "joint_pos", None) if data is not None else None
+                            if joint_pos_abs is None and data is not None:
+                                joint_pos_rel = observations.get("joint_pos", None)
+                                default_joint_pos = getattr(data, "default_joint_pos", None)
+                                if joint_pos_rel is not None and default_joint_pos is not None:
+                                    try:
+                                        joint_pos_abs = joint_pos_rel + default_joint_pos
+                                    except Exception:
+                                        joint_pos_abs = None
+                            if joint_pos_abs is not None:
+                                observations["joint_pos_absolute"] = joint_pos_abs
+                                observations["joint_positions_absolute"] = joint_pos_abs
+                                observations["joint_angles_absolute"] = joint_pos_abs
+                                observations["joint_angles"] = joint_pos_abs
+                                observations["joint_positions"] = joint_pos_abs
+                            default_joint_pos = getattr(data, "default_joint_pos", None) if data is not None else None
+                        if default_joint_pos is not None:
+                            observations["joint_default_pos"] = default_joint_pos
+
+                        # Provide a default desired height for reward code if missing.
+                        target_height = None
+                        if "desired_height" in observations and observations["desired_height"] is not None:
+                            target_height = observations["desired_height"]
+                        else:
+                            target_height = getattr(self_, "default_base_height", None)
+                            if target_height is None and robot_asset is not None:
+                                init_state = getattr(robot_asset, "init_state", None)
+                                if init_state is not None:
+                                    pos = getattr(init_state, "pos", None)
+                                    if pos is not None and len(pos) >= 3:
+                                        try:
+                                            target_height = float(pos[2])
+                                        except (TypeError, ValueError):
+                                            target_height = None
+                        if target_height is not None and "desired_height" not in observations:
+                            try:
+                                observations["desired_height"] = torch.full(
+                                    (self_.num_envs,), float(target_height), device=self_.device
+                                )
+                            except Exception:
+                                pass
+
+                        if observations:
+                            return observations
+                    except Exception:
+                        pass
+
+            # 3) Fallback to known buffers directly
+            d = _fallback_obs_dict_from_buffers(self_)
+            if d is not None:
+                return d
+
+            # 4) Last resort: return an empty dict (keeps Eureka running; prompt will be lighter)
+            return {}
+
+        # Install synthesized _get_observations if missing
+        if not hasattr(env, "_get_observations"):
+            env._get_observations = types.MethodType(_get_observations_synth, env)
+        # Expose synthesized helper in case downstream code references it explicitly.
+        if not hasattr(env, "_get_observations_synth"):
+            env._get_observations_synth = types.MethodType(_get_observations_synth, env)
+
+        # Provide joint limit/count aliases directly on the env for GPT rewards that expect attributes.
+        robot_asset = _get_robot_asset(env)
+        if robot_asset is not None:
+            data = getattr(robot_asset, "data", None)
+            soft_limits = getattr(data, "soft_joint_pos_limits", None) if data is not None else None
+            if soft_limits is not None:
+                env.joint_limit_lower = soft_limits[..., 0]
+                env.joint_limit_upper = soft_limits[..., 1]
+            joint_pos_abs = getattr(data, "joint_pos", None) if data is not None else None
+            if joint_pos_abs is not None:
+                env.joint_pos_abs = joint_pos_abs
+            default_joint_pos = getattr(data, "default_joint_pos", None) if data is not None else None
+            if default_joint_pos is not None:
+                env.joint_default_pos = default_joint_pos
+            if not hasattr(env, "num_joints"):
+                num_joints = getattr(robot_asset, "num_joints", None)
+                if num_joints is None:
+                    for attr_name in ("num_dof", "num_dofs", "num_actuated_joints"):
+                        num_joints = getattr(robot_asset, attr_name, None)
+                        if num_joints is not None:
+                            break
+                if num_joints is None and data is not None:
+                    joint_attr_candidates = (
+                        ("joint_pos", -1),
+                        ("default_joint_pos", -1),
+                        ("soft_joint_pos_limits", -2),
+                    )
+                    for attr_name, axis in joint_attr_candidates:
+                        value = getattr(data, attr_name, None)
+                        if value is None:
+                            continue
+                        if hasattr(value, "shape") and len(value.shape) > 0:
+                            resolved_axis = axis
+                            if axis < 0:
+                                resolved_axis = len(value.shape) + axis
+                                if resolved_axis < 0:
+                                    resolved_axis = len(value.shape) - 1
+                            elif axis >= len(value.shape):
+                                resolved_axis = len(value.shape) - 1
+                            try:
+                                num_joints = int(value.shape[resolved_axis])
+                            except (TypeError, ValueError, IndexError):
+                                num_joints = None
+                        else:
+                            try:
+                                num_joints = len(value)
+                            except TypeError:
+                                num_joints = None
+                        if num_joints is not None:
+                            break
+                    if num_joints is None:
+                        joint_names = getattr(data, "joint_names", None)
+                        if joint_names is not None:
+                            try:
+                                num_joints = len(joint_names)
+                            except TypeError:
+                                num_joints = None
+                if num_joints is not None:
+                    env.num_joints = int(num_joints)
+            if not hasattr(env, "joint_dim"):
+                joint_dim = getattr(robot_asset, "joint_dim", None)
+                if joint_dim is None:
+                    joint_dim = getattr(robot_asset, "num_actuated_joints", None)
+                if joint_dim is None:
+                    joint_dim = getattr(robot_asset, "num_dof", None)
+                if joint_dim is None and data is not None:
+                    joint_axes = getattr(data, "joint_axis", None)
+                    if joint_axes is not None:
+                        try:
+                            joint_dim = len(joint_axes)
+                        except TypeError:
+                            joint_dim = None
+                if joint_dim is None:
+                    joint_dim = getattr(env, "num_joints", None)
+                if joint_dim is not None:
+                    env.joint_dim = int(joint_dim)
+
+        # ---------- REWARDS (oracle hook) ----------
+        # ManagerBasedRLEnv may not expose _get_rewards; alias or create a zero baseline.
+        if not hasattr(env, "_get_rewards"):
+            if hasattr(env, "get_rewards"):
+                env._get_rewards = types.MethodType(env.get_rewards, env)
+            else:
+                def _get_rewards_zero(self_):
+                    # Zero oracle baseline; Eureka layers eureka rewards on top.
+                    return torch.zeros(self_.num_envs, device=self_.device)
+                env._get_rewards = types.MethodType(_get_rewards_zero, env)
+
+        # ---------- DONES ----------
+        if not hasattr(env, "_get_dones"):
+            if hasattr(env, "get_dones"):
+                env._get_dones = types.MethodType(env.get_dones, env)
+            elif hasattr(env, "reset_buf"):
+                def _get_dones_buf(self_):
+                    return self_.reset_buf
+                env._get_dones = types.MethodType(_get_dones_buf, env)
+
+        # ---------- RESET HOOK ----------
+        if not hasattr(env, "_reset_idx"):
+            if hasattr(env, "reset_idx"):
+                env._reset_idx = types.MethodType(env.reset_idx, env)
+            # else: leave it; Eureka template will error if truly missing and we can address that case specifically.
+
 
     @property
     def get_observations_method_as_string(self) -> str:
@@ -222,6 +510,9 @@ class EurekaTaskManager:
         env_cfg.seed = self._env_seed
         self._env = gym.make(self._task, cfg=env_cfg)
 
+        # Ensure DirectRLEnv-style hooks exist even for ManagerBasedRLEnv tasks
+        self._attach_direct_api_shims()
+
     def _prepare_eureka_environment(self, get_rewards_method_as_string: str):
         """Prepare the environment for training with the Eureka-generated reward function.
 
@@ -256,6 +547,27 @@ class EurekaTaskManager:
             exec(template_reset_string_with_success_metric, namespace)
             setattr(env, "_reset_idx", types.MethodType(namespace["_reset_idx"], env))
 
+        # Add commonly used math helpers to the execution namespace so GPT rewards
+        # can call them without explicitly importing.
+        try:
+            from isaaclab.utils.math import (
+                quat_apply,
+                quat_apply_inverse,
+                yaw_quat,
+                wrap_to_pi,
+            )
+            namespace.update(
+                {
+                    "quat_apply": quat_apply,
+                    "quat_apply_inverse": quat_apply_inverse,
+                    "yaw_quat": yaw_quat,
+                    "wrap_to_pi": wrap_to_pi,
+                }
+            )
+        except Exception:
+            # If imports fail, continue; user code may not need them.
+            pass
+
         # Add the GPT generated reward function to the environment
         get_rewards_method_as_string = f"from {env.__module__} import * \nimport torch\n" + get_rewards_method_as_string
         exec(get_rewards_method_as_string, namespace)
@@ -265,6 +577,40 @@ class EurekaTaskManager:
         env._eureka_episode_sums = dict()
         env._eureka_episode_sums["eureka_total_rewards"] = torch.zeros(env.num_envs, device=env.device)
         env._eureka_episode_sums["oracle_total_rewards"] = torch.zeros(env.num_envs, device=env.device)
+
+        # Manager-based environments compute rewards through the reward manager instead of _get_rewards.
+        # In that case, wrap the reward manager so the GPT reward augments the oracle reward and logging stays consistent.
+        reward_manager = getattr(env, "reward_manager", None)
+        if reward_manager is not None and not hasattr(reward_manager, "_compute_original"):
+            import torch
+
+            reward_manager._compute_original = reward_manager.compute
+
+            def _compute_with_eureka(self, dt):
+                oracle = self._compute_original(dt)
+                rewards_eureka, rewards_dict = env._get_rewards_eureka()
+
+                # Sanitize and clip to prevent reward explosions causing NaNs.
+                oracle = torch.nan_to_num(oracle, nan=0.0, posinf=0.0, neginf=0.0)
+                rewards_eureka = torch.nan_to_num(rewards_eureka, nan=0.0, posinf=0.0, neginf=0.0)
+                rewards_eureka = torch.clamp(rewards_eureka, min=-100.0, max=100.0)
+
+                env._eureka_episode_sums["eureka_total_rewards"] += rewards_eureka
+                env._eureka_episode_sums["oracle_total_rewards"] += oracle
+                for key, value in rewards_dict.items():
+                    if key not in env._eureka_episode_sums:
+                        env._eureka_episode_sums[key] = torch.zeros_like(value)
+                    env._eureka_episode_sums[key] += torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+                # Update the internal reward buffer so all downstream consumers see the combined reward.
+                if hasattr(self, "_reward_buf"):
+                    self._reward_buf += rewards_eureka
+                    combined = self._reward_buf
+                else:
+                    combined = oracle + rewards_eureka
+                combined = torch.clamp(combined, min=-1000.0, max=1000.0)
+                return combined
+
+            reward_manager.compute = types.MethodType(_compute_with_eureka, reward_manager)
 
     def _run_training(self, framework: Literal["rsl_rl", "rl_games"] = "rsl_rl"):
         """Run the training of the task."""

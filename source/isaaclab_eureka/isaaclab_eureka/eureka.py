@@ -20,6 +20,10 @@ from isaaclab_eureka.managers import EurekaTaskManager, LLMManager
 from isaaclab_eureka.utils import load_tensorboard_logs
 
 
+MAX_FEEDBACK_VALUES = 64
+MAX_FEEDBACK_CHARS = 30_000
+
+
 class Eureka:
     """Orchestrates the training of the RL agent using the LLM."""
 
@@ -34,6 +38,8 @@ class Eureka:
         temperature: float = 1.0,
         gpt_model: str = "gpt-4",
         num_parallel_runs: int = 1,
+        prompt_addendum: str | None = None,
+        manual_reward: str | None = None,
     ):
         """Initialize the Eureka class.
 
@@ -64,6 +70,12 @@ class Eureka:
         self._task_description = task_description
         self._feedback_subsampling = feedback_subsampling
         self._num_processes = num_parallel_runs
+        self._prompt_addendum = prompt_addendum.strip() if prompt_addendum else ""
+        self._manual_reward = manual_reward.strip() if manual_reward else None
+        if self._manual_reward and not self._manual_reward.lstrip().startswith("def _get_rewards_eureka("):
+            raise ValueError(
+                "Manual reward overrides must begin with the function definition 'def _get_rewards_eureka(self)'."
+            )
 
         print("[INFO]: Setting up the LLM Manager...")
         self._llm_manager = LLMManager(
@@ -106,6 +118,7 @@ class Eureka:
             success_metric_to_win=self._success_metric_to_win,
             get_observations_method_as_string=self._task_manager.get_observations_method_as_string,
         )
+        user_prompt = self._augment_user_prompt(user_prompt)
         # The assistant prompt is used to feed the previous LLM output back into the LLM
         assistant_prompt = None
 
@@ -115,8 +128,14 @@ class Eureka:
         for iter in range(max_eureka_iterations):
             print(f"\n{'#' * 20} Running Eureka Iteration {iter} {'#' * 20} \n")
             # Generate the GPT reward methods
-            llm_outputs = self._llm_manager.prompt(user_prompt=user_prompt, assistant_prompt=assistant_prompt)
-            gpt_reward_method_strings = llm_outputs["reward_strings"]
+            manual_iteration = self._manual_reward is not None and iter == 0
+            if manual_iteration:
+                reward_strings = [self._manual_reward for _ in range(self._num_processes)]
+                llm_outputs = {"reward_strings": reward_strings, "raw_outputs": reward_strings}
+                gpt_reward_method_strings = reward_strings
+            else:
+                llm_outputs = self._llm_manager.prompt(user_prompt=user_prompt, assistant_prompt=assistant_prompt)
+                gpt_reward_method_strings = llm_outputs["reward_strings"]
             # Log the llm outputs
             for idx, gpt_reward_method_string in enumerate(gpt_reward_method_strings):
                 self._tensorboard_writer.add_text(f"Run_{idx}/raw_llm_output", llm_outputs["raw_outputs"][idx], iter)
@@ -180,11 +199,19 @@ class Eureka:
                 break
 
             assistant_prompt = results[best_run_idx]["assistant_prompt"]
-            user_prompt = results[best_run_idx]["user_prompt"]
+            user_prompt = self._augment_user_prompt(results[best_run_idx]["user_prompt"])
 
         self._log_final_results(best_run_results)
         # Close the task manager
         self._task_manager.close()
+
+    def _augment_user_prompt(self, prompt: str) -> str:
+        """Append additional guidance to the user prompt, if provided."""
+        if not self._prompt_addendum:
+            return prompt
+        if self._prompt_addendum not in prompt:
+            return f"{prompt}\n\n{self._prompt_addendum}"
+        return prompt
 
     def _get_eureka_task_feedback(self, log_dir: str, feedback_subsampling: int) -> tuple[str, float, float]:
         """Get the feedback for the Eureka task.
@@ -223,7 +250,8 @@ class Eureka:
                 if metric_name == "success_metric":
                     metric_name = "task_score"
                     success_metric_max = metric_best
-                data_string = [f"{data:.2f}" for data in metric_data[::feedback_subsampling]]
+                sampled_values = metric_data[::feedback_subsampling][:MAX_FEEDBACK_VALUES]
+                data_string = [f"{data:.2f}" for data in sampled_values]
                 feedback_string = (
                     f"{metric_name}: {data_string}, Min: {metric_min:.2f}, Max: {metric_max:.2f}, Mean:"
                     f" {metric_mean:.2f} \n"
@@ -234,6 +262,13 @@ class Eureka:
                 total_feed_back_string += feedback_string
 
         total_feed_back_string += f"\nThe desired task_score to win is: {self._success_metric_to_win:.2f}\n"
+        if len(total_feed_back_string) > MAX_FEEDBACK_CHARS:
+            head = MAX_FEEDBACK_CHARS // 2
+            tail = MAX_FEEDBACK_CHARS - head
+            notice = "\n\n[truncated feedback to stay within prompt budget]\n\n"
+            total_feed_back_string = (
+                f"{total_feed_back_string[:head]}{notice}{total_feed_back_string[-tail:]}"
+            )
         return total_feed_back_string, success_metric_max, rewards_correlation
 
     def _log_iteration_results(self, iter: int, results: list):
