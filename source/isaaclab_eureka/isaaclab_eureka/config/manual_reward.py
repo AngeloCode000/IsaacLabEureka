@@ -202,7 +202,7 @@ def _get_rewards_eureka(self):
     collapse_depth = torch.relu(collapse_target - base_height)
 
     # Make this big enough to matter relative to ~100+ forward reward.
-    collapse_penalty = 200.0 * collapse_depth
+    collapse_penalty = 140.0 * collapse_depth
 
     # Mask out locomotion rewards when the base is clearly below trot height.
     upright_mask = torch.where(base_height > collapse_target, torch.ones_like(base_height), torch.zeros_like(base_height))
@@ -239,7 +239,7 @@ def _get_rewards_eureka(self):
     pose_penalty = torch.zeros(self.num_envs, device=device)
     if default_joint_positions is not None:
         default_joint_positions = default_joint_positions.to(device)
-        pose_penalty = 0.05 * torch.mean(
+        pose_penalty = 0.01 * torch.mean(
             torch.square(joint_positions - default_joint_positions), dim=-1
         )  # tune weight
 
@@ -251,13 +251,13 @@ def _get_rewards_eureka(self):
         torch.full_like(command_speed_scalar, 1.2),
         torch.ones_like(command_speed_scalar),
     )
-    joint_motion_penalty = 0.015 * smooth_scale * torch.mean(torch.abs(joint_velocities), dim=-1)
+    joint_motion_penalty = 0.01 * smooth_scale * torch.mean(torch.abs(joint_velocities), dim=-1)
 
     if not hasattr(self, "_prev_joint_velocities"):
         self._prev_joint_velocities = torch.zeros_like(joint_velocities)
     joint_acc = torch.abs(joint_velocities - self._prev_joint_velocities) / max(step_dt, 1e-3)
     joint_acc_clipped = torch.clamp(joint_acc, max=200.0)
-    joint_acc_penalty = 0.004 * smooth_scale * torch.mean(joint_acc_clipped, dim=-1)
+    joint_acc_penalty = 0.002 * smooth_scale * torch.mean(joint_acc_clipped, dim=-1)
     self._prev_joint_velocities = joint_velocities.detach().clone()
 
     excess_upper = torch.relu(joint_positions - joint_limit_upper)
@@ -277,13 +277,13 @@ def _get_rewards_eureka(self):
     # Choose a "too bent" threshold in radians.
     # Example: if standing knees are ~0.6 rad and crawling is > 1.2 rad,
     # set threshold somewhere around 0.9–1.0.
-    kneel_thresh = 1.0
+    kneel_thresh = 1.35
 
     # Penalize only the excess beyond this threshold
     knee_flex_excess = torch.relu(torch.abs(knee_angles) - kneel_thresh)
 
     # Weight so that staying in a deep crouch is clearly worse than standing.
-    knee_pose_penalty = 6.0 * knee_flex_excess.mean(dim=-1)
+    knee_pose_penalty = 0.8 * knee_flex_excess.mean(dim=-1)
 
     # ---------------------------------------------------------------------
     # 10) Explicit action-rate penalty (blog: ||a_t - a_{t-1}||^2)
@@ -299,9 +299,9 @@ def _get_rewards_eureka(self):
             self._prev_action_delta = torch.zeros_like(actions)
         action_delta = actions - self._prev_actions
         action_delta_clipped = torch.clamp(action_delta, min=-2.0, max=2.0)
-        action_rate_penalty = 0.015 * torch.mean(torch.square(action_delta_clipped), dim=-1)
+        action_rate_penalty = 0.01 * torch.mean(torch.square(action_delta_clipped), dim=-1)
         action_jerk = (action_delta_clipped - self._prev_action_delta) / max(step_dt, 1e-3)
-        action_jerk_penalty = 0.003 * torch.mean(torch.abs(action_jerk), dim=-1)
+        action_jerk_penalty = 0.002 * torch.mean(torch.abs(action_jerk), dim=-1)
         self._prev_actions = actions.detach().clone()
         self._prev_action_delta = action_delta_clipped.detach().clone()
 
